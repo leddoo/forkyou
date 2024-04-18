@@ -63,7 +63,7 @@ pub fn scope<'p, R, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
         let save = alloc.save();
 
         let scope = Scope {
-            alloc: unsafe { sti::erase!(&Arena, alloc) },
+            alloc,
             state: ScopeState {
                 panic: AtomicBool::new(false),
                 running: AtomicUsize::new(0),
@@ -122,11 +122,11 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
             ptr: unsafe { NonNull::new_unchecked(ptr).cast() },
             call: |ptr| {
                 let ptr = ptr.cast::<FBox<R, F>>().as_ptr();
-                let f = unsafe { (&mut (*ptr).f as *mut F).read() };
                 let scope = unsafe { (*ptr).scope };
                 let result = unsafe { &(*ptr).result };
                 debug_assert_eq!(result.state.load(Ordering::SeqCst), SCOPE_TASK_RESULT_WAIT);
 
+                let f = unsafe { (&mut (*ptr).f as *mut F).read() };
                 // @panic.
                 let value = f();
 
@@ -172,4 +172,101 @@ impl<'s, R> ScopeTask<'s, R> {
 }
 
 
+
+
+/// tasks can borrow locals from parent.
+/// ```rust
+/// let foo = 42;
+/// forkyou::scope(|scope| {
+///     scope.spawn(|| foo);
+/// });
+/// ```
+///
+/// tasks cannot borrow locals from scope.
+/// ```compile_fail
+/// forkyou::scope(|scope| {
+///     let foo = 42;
+///     scope.spawn(|| foo);
+/// });
+/// ```
+///
+/// scope can assign locals from parent.
+/// ```rust
+/// let mut foo = None;
+/// forkyou::scope(|scope| {
+///     // can assign locals from parent.
+///     foo = Some(42);
+/// });
+/// ```
+///
+/// single task can assign locals from parent.
+/// ```rust
+/// let mut foo = None;
+/// forkyou::scope(|scope| {
+///     scope.spawn(|| foo = Some(42));
+/// });
+/// ```
+///
+/// multiple tasks cannot mutably borrow locals from parent.
+/// ```compile_fail
+/// let mut foo = None;
+/// forkyou::scope(|scope| {
+///     scope.spawn(|| foo = Some(42));
+///     scope.spawn(|| foo = Some(42));
+/// });
+/// ```
+///
+/// allocations cannot escape scope.
+/// ```compile_fail
+/// let mut foo = &mut 42;
+/// forkyou::scope(|scope| {
+///     foo = scope.alloc().alloc_new(42);
+/// });
+/// ```
+#[allow(dead_code)]
+struct DocTests;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use sti::sync::spin_lock::SpinLock;
+
+
+    #[test]
+    fn untracked() {
+        let result = Arc::new(Mutex::new(None));
+
+        super::spawn_untracked(sti::enclose!(result; move || {
+            let mut lock = result.lock().unwrap();
+            assert!(lock.is_none());
+            *lock = Some(42);
+        }));
+
+        let result = loop {
+            let lock = result.lock().unwrap();
+            if let Some(result) = *lock {
+                break result;
+            }
+        };
+        assert_eq!(result, 42);
+    }
+
+
+    #[test]
+    fn scoped() {
+        let the_result = 42;
+        let result = super::scope(|scope| {
+            let result = &*scope.alloc().alloc_new(SpinLock::new(None));
+
+            scope.spawn(|| {
+                *result.lock() = Some(the_result);
+            }).join();
+
+            scope.spawn(|| {
+                return result.lock().unwrap();
+            }).join()
+        });
+        assert_eq!(result, 42);
+    }
+}
 
