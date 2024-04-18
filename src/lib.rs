@@ -1,6 +1,7 @@
 use sti::alloc::{Alloc, GlobalAlloc};
 use sti::arena::Arena;
 use sti::boks::Box;
+use sti::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use core::cell::UnsafeCell;
@@ -19,6 +20,20 @@ fn box_into_inner<T, A: Alloc>(this: Box<T, A>) -> T {
     let result = unsafe { ManuallyDrop::take(&mut *this) };
     return result;
 }
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SendPtr<T>(pub *const T);
+
+unsafe impl<T> Sync for SendPtr<T> {}
+unsafe impl<T> Send for SendPtr<T> {}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SendPtrMut<T>(pub *mut T);
+
+unsafe impl<T> Sync for SendPtrMut<T> {}
+unsafe impl<T> Send for SendPtrMut<T> {}
 
 
 
@@ -101,6 +116,7 @@ pub struct Scope<'s, 'p: 's> {
     _p: CovariantLifetime<'p>,
 }
 
+// @todo: this is probably too small.
 const SCOPE_ARENA_INITIAL_SIZE: usize = 64*1024;
 
 struct ScopeState {
@@ -186,6 +202,47 @@ impl<'s, R> ScopeTask<'s, R> {
 
 
 
+pub fn for_each<T: Sync, F: Fn(&T) + Sync>(values: &[T], f: F) {
+    let f = &f;
+    scope(move |scope| {
+        for value in values {
+            scope.spawn(move || f(value));
+        }
+    });
+}
+
+
+pub fn map<T: Sync, U: Send, F: Fn(&T) -> U + Sync>(values: &[T], f: F) -> Vec<U> {
+    map_in(GlobalAlloc, values, f)
+}
+
+pub fn map_in<A: Alloc, T: Sync, U: Send, F: Fn(&T) -> U + Sync>(alloc: A, values: &[T], f: F) -> Vec<U, A> {
+    let mut result = Vec::with_cap_in(alloc, values.len());
+    map_into(&mut result, values, f);
+    return result;
+}
+
+pub fn map_into<A: Alloc, T: Sync, U: Send, F: Fn(&T) -> U + Sync>(out: &mut Vec<U, A>, values: &[T], f: F) {
+    out.reserve_extra(values.len());
+
+    let f = &f;
+    let dst = unsafe { SendPtrMut(out.as_mut_ptr().add(out.len())) };
+    scope(move |scope| {
+        let dst = dst;
+        for (i, value) in values.iter().enumerate() {
+            let dst = unsafe { SendPtrMut(dst.0.add(i)) };
+            scope.spawn(move || unsafe {
+                let dst = dst;
+                dst.0.write(f(value));
+            });
+        }
+    });
+
+    unsafe { out.set_len(out.len() + values.len()) }
+}
+
+
+
 
 /// tasks can borrow locals from parent.
 /// ```rust
@@ -264,6 +321,8 @@ struct DocTests;
 mod tests {
     use std::sync::{Arc, Mutex};
     use sti::sync::spin_lock::SpinLock;
+    use sti::vec::Vec;
+    use core::sync::atomic::{Ordering, AtomicU32};
 
 
     #[test]
@@ -333,6 +392,31 @@ mod tests {
             return *x + y;
         });
         assert_eq!(result, 69);
+    }
+
+    #[test]
+    fn for_each() {
+        let values = Vec::from_iter(0..100);
+
+        let result = AtomicU32::new(0);
+        super::for_each(&values, |v| {
+            result.fetch_add(*v, Ordering::Relaxed);
+        });
+
+        assert_eq!(result.load(Ordering::Relaxed), 99*100/2);
+    }
+
+    #[test]
+    fn map() {
+        let values = Vec::from_iter(0..100);
+
+        let squared = super::map(&values, |v| *v * *v);
+        assert_eq!(squared.cap(), 100);
+        assert_eq!(squared.len(), 100);
+
+        for (i, v) in values.iter().copied().enumerate() {
+            assert_eq!(squared[i], v*v)
+        }
     }
 }
 
