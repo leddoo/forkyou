@@ -53,8 +53,12 @@ pub fn spawn_untracked<F: FnOnce() + Send + 'static>(f: F) {
 pub fn scope<'p, R, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
     thread_local! {
         static SCOPE_ARENA: Arena = {
-            let arena = Arena::new();
-            arena.min_block_size.set(64*1024);
+            let mut arena = Arena::new();
+            arena.min_block_size.set(SCOPE_ARENA_INITIAL_SIZE);
+            // make sure root scope doesn't save "arena has no blocks",
+            // and then frees everything on restore.
+            arena.alloc_new(1);
+            arena.reset();
             arena
         };
     };
@@ -89,12 +93,15 @@ pub fn scope<'p, R, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
     })
 }
 
+
 pub struct Scope<'s, 'p: 's> {
     alloc: &'s Arena,
     state: ScopeState,
     _s: InvariantLifetime<'s>,
     _p: CovariantLifetime<'p>,
 }
+
+const SCOPE_ARENA_INITIAL_SIZE: usize = 64*1024;
 
 struct ScopeState {
     panic: AtomicBool,
@@ -294,6 +301,38 @@ mod tests {
             }).join()
         });
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn nested_scopes() {
+        let result = super::scope(|scope| {
+            assert_eq!(scope.alloc().stats().total_allocated, super::SCOPE_ARENA_INITIAL_SIZE);
+
+            let p1 = scope.alloc() as *const _ as usize;
+
+            let n0 = scope.alloc().current_block_used();
+            let x = scope.alloc().alloc_new(33);
+            let n1 = scope.alloc().current_block_used();
+            assert_eq!(n1 - n0, 4);
+
+            let y = super::scope(|scope| {
+                let p2 = scope.alloc() as *const _ as usize;
+                assert_eq!(p2, p1);
+
+                let n2 = scope.alloc().current_block_used();
+                let x = scope.alloc().alloc_new(36);
+                let n3 = scope.alloc().current_block_used();
+                assert_eq!(n3 - n2, 4);
+
+                return *x;
+            });
+
+            let n4 = scope.alloc().current_block_used();
+            assert_eq!(n4, n1);
+
+            return *x + y;
+        });
+        assert_eq!(result, 69);
     }
 }
 
