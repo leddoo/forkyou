@@ -74,9 +74,15 @@ pub fn scope<'p, R, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
 
         let result = f(&scope);
 
-        // @temp
+        // @temp: wait for tasks to complete.
         assert_eq!(scope.state.running.load(Ordering::SeqCst), 0);
 
+        // safety:
+        // - allocations cannot escape `f`, so there are no external dangling refs.
+        // - during the execution of inner scopes, outer scopes are inaccessible,
+        //   so inner scopes cannot accidentally free outer allocations.
+        // - tasks cannot access outer scopes, so they can't make allocations while
+        //   inner scopes are running.
         unsafe { alloc.restore(save) };
 
         return result
@@ -143,7 +149,7 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
 
         unsafe { spawn_raw(task) };
 
-        // @temp!
+        // @temp: wait for task to complete in join.
         assert_eq!(result.state.load(Ordering::SeqCst), SCOPE_TASK_RESULT_DONE);
         let temp = unsafe { result.value.get().read().assume_init() };
 
@@ -183,6 +189,7 @@ impl<'s, R> ScopeTask<'s, R> {
 /// ```
 ///
 /// tasks cannot borrow locals from scope.
+/// this is necessary because tasks may not complete before the closure returns.
 /// ```compile_fail
 /// forkyou::scope(|scope| {
 ///     let foo = 42;
@@ -194,7 +201,6 @@ impl<'s, R> ScopeTask<'s, R> {
 /// ```rust
 /// let mut foo = None;
 /// forkyou::scope(|scope| {
-///     // can assign locals from parent.
 ///     foo = Some(42);
 /// });
 /// ```
@@ -217,10 +223,31 @@ impl<'s, R> ScopeTask<'s, R> {
 /// ```
 ///
 /// allocations cannot escape scope.
+/// this is necessary for the use Arena::save/restore to be safe.
 /// ```compile_fail
 /// let mut foo = &mut 42;
 /// forkyou::scope(|scope| {
 ///     foo = scope.alloc().alloc_new(42);
+/// });
+/// ```
+///
+/// tasks cannot access scope.
+/// this is necessary for the use Arena::save/restore to be safe.
+/// ```compile_fail
+/// forkyou::scope(|scope| {
+///     scope.spawn(|| {
+///         scope.alloc().alloc_new(42);
+///     });
+/// });
+/// ```
+///
+/// inner scope cannot access outer scope.
+/// this is necessary for the use Arena::save/restore to be safe.
+/// ```compile_fail
+/// forkyou::scope(|scope| {
+///     forkyou::scope(|_| {
+///         scope.alloc().alloc_new(42);
+///     });
 /// });
 /// ```
 #[allow(dead_code)]
