@@ -1,0 +1,8 @@
+[package]
+name = "forkyou"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sti = { git = "https://github.com/leddoo/sti" }
+
