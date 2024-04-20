@@ -8,6 +8,8 @@ use core::cell::UnsafeCell;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::marker::PhantomData;
 
+pub mod deque;
+
 
 // temp sti stuff:
 type CovariantLifetime<'a>     = PhantomData<fn()       -> &'a ()>;
@@ -211,6 +213,15 @@ pub fn for_each<T: Sync, F: Fn(&T) + Sync>(values: &[T], f: F) {
     });
 }
 
+pub fn for_each_mut<T: Send, F: Fn(&mut T) + Sync>(values: &mut [T], f: F) {
+    let f = &f;
+    scope(move |scope| {
+        for value in values {
+            scope.spawn(move || f(value));
+        }
+    });
+}
+
 
 pub fn map<T: Sync, U: Send, F: Fn(&T) -> U + Sync>(values: &[T], f: F) -> Vec<U> {
     map_in(GlobalAlloc, values, f)
@@ -396,14 +407,21 @@ mod tests {
 
     #[test]
     fn for_each() {
-        let values = Vec::from_iter(0..100);
+        let mut values = Vec::from_iter(0..100);
 
         let result = AtomicU32::new(0);
         super::for_each(&values, |v| {
             result.fetch_add(*v, Ordering::Relaxed);
         });
-
         assert_eq!(result.load(Ordering::Relaxed), 99*100/2);
+
+        super::for_each_mut(&mut values, |v| *v += 1);
+
+        let result = AtomicU32::new(0);
+        super::for_each(&values, |v| {
+            result.fetch_add(*v, Ordering::Relaxed);
+        });
+        assert_eq!(result.load(Ordering::Relaxed), 100*101/2);
     }
 
     #[test]
