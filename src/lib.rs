@@ -9,6 +9,7 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::marker::PhantomData;
 
 pub mod deque;
+pub mod state_cache;
 
 
 // temp sti stuff:
@@ -36,6 +37,20 @@ pub struct SendPtrMut<T>(pub *mut T);
 
 unsafe impl<T> Sync for SendPtrMut<T> {}
 unsafe impl<T> Send for SendPtrMut<T> {}
+
+
+
+
+#[inline]
+pub fn ncpu() -> usize {
+    thread_local! {
+        static NCPU: usize =
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+    }
+
+    NCPU.with(|ncpu| *ncpu)
+}
 
 
 

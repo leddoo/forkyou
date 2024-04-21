@@ -6,13 +6,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 
 // impl of "Dynamic Circular Work-Stealing Deque" by Chase and Lev, SPAA 2005
-pub struct Deque<T> {
+pub struct Deque<T: Send> {
     begin: AtomicUsize,
     end: AtomicUsize,
     buffer: RwSpinLock<Buffer<T>>,
 }
 
-impl<T> Deque<T> {
+impl<T: Send> Deque<T> {
     pub fn new() -> Self {
         Self {
             begin: AtomicUsize::new(0),
