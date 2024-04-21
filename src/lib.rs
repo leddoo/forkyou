@@ -1,3 +1,5 @@
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 use sti::alloc::{Alloc, GlobalAlloc};
 use sti::arena::Arena;
 use sti::boks::Box;
@@ -63,11 +65,37 @@ pub fn ncpu() -> usize {
 
 
 pub struct Task {
-    pub ptr: NonNull<u8>,
-    pub call: fn(NonNull<u8>),
+    ptr: NonNull<u8>,
+    call: fn(NonNull<u8>),
+}
+
+impl Task {
+    #[inline]
+    pub unsafe fn new(ptr: NonNull<u8>, call: fn(NonNull<u8>)) -> Self {
+        Self { ptr, call }
+    }
+
+    #[inline]
+    pub fn call(self) {
+        (self.call)(self.ptr);
+    }
 }
 
 unsafe impl Send for Task {}
+
+
+/*
+pub struct StackTask<R, F> {
+    result: MaybeUninit<R>,
+    f: F,
+}
+
+impl<R, F> StackTask<R, F> {
+    pub unsafe fn new(f: F) -> Self  where F: FnOnce() -> R + Send {
+        Self { result: MaybeUninit::uninit(), f }
+    }
+}
+*/
 
 
 
@@ -82,12 +110,12 @@ pub fn spawn_untracked<F: FnOnce() + Send + 'static>(f: F) {
             f();
         },
     };
-    unsafe { Runtime::submit_task(task) }
+    Runtime::submit_task(task);
 }
 
 
 
-pub fn scope<'p, R, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
+pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
     thread_local! {
         static SCOPE_ARENA: Arena = {
             let mut arena = Arena::new();
@@ -100,33 +128,35 @@ pub fn scope<'p, R, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
         };
     };
 
-    SCOPE_ARENA.with(|alloc| {
-        let save = alloc.save();
+    Runtime::on_worker(|| {
+        SCOPE_ARENA.with(|alloc| {
+            let save = alloc.save();
 
-        let scope = Scope {
-            alloc,
-            state: ScopeState {
-                panic: AtomicBool::new(false),
-                running: AtomicUsize::new(0),
-            },
-            _s: Default::default(),
-            _p: Default::default(),
-        };
+            let scope = Scope {
+                alloc,
+                state: ScopeState {
+                    panic: AtomicBool::new(false),
+                    running: AtomicUsize::new(0),
+                },
+                _s: Default::default(),
+                _p: Default::default(),
+            };
 
-        let result = f(&scope);
+            let result = f(&scope);
 
-        // @temp: wait for tasks to complete.
-        assert_eq!(scope.state.running.load(Ordering::SeqCst), 0);
+            // @temp: wait for tasks to complete.
+            assert_eq!(scope.state.running.load(Ordering::SeqCst), 0);
 
-        // safety:
-        // - allocations cannot escape `f`, so there are no external dangling refs.
-        // - during the execution of inner scopes, outer scopes are inaccessible,
-        //   so inner scopes cannot accidentally free outer allocations.
-        // - tasks cannot access outer scopes, so they can't make allocations while
-        //   inner scopes are running.
-        unsafe { alloc.restore(save) };
+            // safety:
+            // - allocations cannot escape `f`, so there are no external dangling refs.
+            // - during the execution of inner scopes, outer scopes are inaccessible,
+            //   so inner scopes cannot accidentally free outer allocations.
+            // - tasks cannot access outer scopes, so they can't make allocations while
+            //   inner scopes are running.
+            unsafe { alloc.restore(save) };
 
-        return result
+            return result
+        })
     })
 }
 
@@ -192,7 +222,7 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
         let prev_running = self.state.running.fetch_add(1, Ordering::SeqCst);
         assert!(prev_running < usize::MAX);
 
-        unsafe { Runtime::submit_task(task) };
+        Runtime::submit_task_on_worker(task);
 
         // @temp: wait for task to complete in join.
         assert_eq!(result.state.load(Ordering::SeqCst), SCOPE_TASK_RESULT_DONE);

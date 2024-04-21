@@ -16,16 +16,50 @@ pub(crate) struct Worker {
 }
 
 pub(crate) struct Sleeper {
-    mutex: Mutex<bool>,
+    sleeping: Mutex<bool>,
     condvar: Condvar,
+}
+
+impl Sleeper {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            sleeping: Mutex::new(false),
+            condvar: Condvar::new(),
+        }
+    }
+
+    #[inline]
+    pub fn prime(&self) {
+        let mut sleeping = self.sleeping.lock().unwrap();
+        *sleeping = true;
+    }
+
+    #[inline]
+    pub fn sleep(&self) {
+        let mut sleeping = self.sleeping.lock().unwrap();
+        if *sleeping {
+            sleeping = self.condvar.wait(sleeping).unwrap();
+            debug_assert!(!*sleeping);
+        }
+    }
+
+    #[inline]
+    pub fn wake(&self) -> bool {
+        let mut sleeping = self.sleeping.lock().unwrap();
+        let was_sleeping = core::mem::replace(&mut *sleeping, false);
+        drop(sleeping);
+
+        if was_sleeping {
+            self.condvar.notify_one();
+        }
+        return was_sleeping;
+    }
 }
 
 impl Worker {
     pub fn spawn() -> Arc<Sleeper> {
-        let sleeper = Arc::new(Sleeper {
-            mutex: Mutex::new(false),
-            condvar: Condvar::new(),
-        });
+        let sleeper = Arc::new(Sleeper::new());
 
         std::thread::spawn(sti::enclose!(sleeper; || {
             let mut dont_touch_this = Worker {
@@ -36,7 +70,7 @@ impl Worker {
                 ptr.set(&mut dont_touch_this);
             });
 
-            Self::main();
+            Self::main(Self::current());
         }));
 
         return sleeper;
@@ -63,10 +97,29 @@ impl Worker {
         unsafe { self.deque.push(task) }
     }
 
-    fn main() {
+    fn main(&self) {
         loop {
+            self.sleeper.prime();
+            self.sleeper.sleep();
+
             println!("working {:p}", Self::current());
+
+            while let Some(task) = self.find_task() {
+                task.call();
+            }
         }
+    }
+
+    fn find_task(&self) -> Option<Task> {
+        if let Some(task) = unsafe { self.deque.pop() } {
+            return Some(task);
+        }
+
+        if let Some(task) = crate::Runtime::get().steal_task() {
+            return Some(task);
+        }
+
+        return None;
     }
 }
 

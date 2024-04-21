@@ -1,7 +1,8 @@
 use sti::vec::Vec;
-use std::sync::{Arc, Mutex, Condvar};
-use core::mem::MaybeUninit;
+use std::sync::{Arc, Mutex};
+use core::mem::{MaybeUninit, ManuallyDrop};
 use core::sync::atomic::{AtomicU8, Ordering};
+use core::ptr::NonNull;
 
 use crate::Task;
 use crate::deque::Deque;
@@ -16,17 +17,22 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    pub unsafe fn submit_task(task: Task) {
+    pub fn submit_task(task: Task) {
         if let Some(worker) = Worker::try_current() {
             unsafe { worker.push_task(task) }
         }
         else {
-            unsafe { Self::inject_task(task) }
+            Self::inject_task(task);
         }
     }
 
+    pub fn submit_task_on_worker(task: Task) {
+        let worker = Worker::current();
+        unsafe { worker.push_task(task) }
+    }
+
     #[cold]
-    pub unsafe fn inject_task(task: Task) {
+    pub fn inject_task(task: Task) {
         let this = Self::get();
 
         unsafe {
@@ -35,17 +41,69 @@ impl Runtime {
             drop(guard);
         }
 
-        todo!("wake worker if necessary")
+        for sleeper in this.sleepers.iter() {
+            if sleeper.wake() {
+                break;
+            }
+        }
     }
 
     pub fn on_worker<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
         if Worker::try_current().is_some() {
-            return f();
+            f()
+        }
+        else {
+            Self::on_worker_slow_path(f)
+        }
+    }
+
+    #[cold]
+    pub fn on_worker_slow_path<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
+        thread_local! {
+            static SLEEPER: Sleeper = Sleeper::new();
         }
 
-        // stack task.
-        // maybe like a thread local sleeper?
-        todo!()
+        SLEEPER.with(|sleeper| {
+            struct FBox<'a, R, F> {
+                f: ManuallyDrop<F>,
+                sleeper: &'a Sleeper,
+                result: MaybeUninit<R>,
+            }
+
+            let mut fbox = FBox {
+                f: ManuallyDrop::new(f),
+                sleeper,
+                result: MaybeUninit::uninit(),
+            };
+
+            let ptr = NonNull::from(&mut fbox).cast();
+            let call = |ptr: NonNull<u8>| {
+                let ptr = ptr.cast::<FBox<R, F>>().as_ptr();
+                let fbox = unsafe { &mut *ptr };
+
+                // @panic.
+                let f = unsafe { ManuallyDrop::take(&mut fbox.f) };
+
+                let result = f();
+                fbox.result = MaybeUninit::new(result);
+
+                fbox.sleeper.wake();
+            };
+
+            sleeper.prime();
+
+            let task = unsafe { Task::new(ptr, call) };
+            Runtime::inject_task(task);
+
+            sleeper.sleep();
+
+            return unsafe { fbox.result.assume_init() };
+        })
+    }
+
+    #[inline]
+    pub fn steal_task(&self) -> Option<Task> {
+        self.injector_deque.steal().ok()
     }
 }
 
@@ -60,7 +118,7 @@ const INIT: u8 = 2;
 
 impl Runtime {
     #[inline]
-    fn get() -> &'static Self {
+    pub fn get() -> &'static Self {
         let s = STATE.load(Ordering::Acquire);
         if s == INIT {
             return unsafe { &mut *RUNTIME.as_mut_ptr() };
