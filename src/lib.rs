@@ -11,6 +11,11 @@ use core::marker::PhantomData;
 pub mod deque;
 pub mod state_cache;
 
+pub use state_cache::StateCache;
+
+mod runtime;
+mod worker;
+
 
 // temp sti stuff:
 type CovariantLifetime<'a>     = PhantomData<fn()       -> &'a ()>;
@@ -40,6 +45,9 @@ unsafe impl<T> Send for SendPtrMut<T> {}
 
 
 
+use runtime::Runtime;
+
+
 
 #[inline]
 pub fn ncpu() -> usize {
@@ -59,10 +67,7 @@ pub struct Task {
     pub call: fn(NonNull<u8>),
 }
 
-pub unsafe fn spawn_raw(task: Task) {
-    // @temp
-    (task.call)(task.ptr)
-}
+unsafe impl Send for Task {}
 
 
 
@@ -77,7 +82,7 @@ pub fn spawn_untracked<F: FnOnce() + Send + 'static>(f: F) {
             f();
         },
     };
-    unsafe { spawn_raw(task) }
+    unsafe { Runtime::submit_task(task) }
 }
 
 
@@ -187,7 +192,7 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
         let prev_running = self.state.running.fetch_add(1, Ordering::SeqCst);
         assert!(prev_running < usize::MAX);
 
-        unsafe { spawn_raw(task) };
+        unsafe { Runtime::submit_task(task) };
 
         // @temp: wait for task to complete in join.
         assert_eq!(result.state.load(Ordering::SeqCst), SCOPE_TASK_RESULT_DONE);
