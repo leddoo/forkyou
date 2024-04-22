@@ -29,9 +29,42 @@ pub trait Spliterator: Sized {
 }
 
 pub trait IntoSpliterator {
-    type I: Spliterator;
+    type I: Spliterator<Item = Self::Item>;
+    type Item;
 
-    fn spliter(self) -> Self::I;
+    fn into_spliterator(self) -> Self::I;
+}
+
+
+pub trait IntoSpliteratorRef<'a> {
+    type I: Spliterator + 'a;
+
+    fn spliter(&'a self) -> Self::I;
+}
+
+impl<'a, T: ?Sized + 'a> IntoSpliteratorRef<'a> for T  where &'a T: IntoSpliterator {
+    type I = <&'a T as IntoSpliterator>::I;
+
+    #[inline]
+    fn spliter(&'a self) -> Self::I {
+        IntoSpliterator::into_spliterator(self)
+    }
+}
+
+
+pub trait IntoSpliteratorRefMut<'a> {
+    type I: Spliterator + 'a;
+
+    fn spliter_mut(&'a mut self) -> Self::I;
+}
+
+impl<'a, T: ?Sized + 'a> IntoSpliteratorRefMut<'a> for T  where &'a mut T: IntoSpliterator {
+    type I = <&'a mut T as IntoSpliterator>::I;
+
+    #[inline]
+    fn spliter_mut(&'a mut self) -> Self::I {
+        IntoSpliterator::into_spliterator(self)
+    }
 }
 
 
@@ -65,9 +98,10 @@ pub mod slice {
 
     impl<'a, T> IntoSpliterator for &'a [T] {
         type I = Spliter<'a, T>;
+        type Item = &'a T;
 
         #[inline]
-        fn spliter(self) -> Self::I {
+        fn into_spliterator(self) -> Self::I {
             Spliter { inner: self.iter() }
         }
     }
@@ -100,9 +134,10 @@ pub mod slice {
 
     impl<'a, T> IntoSpliterator for &'a mut [T] {
         type I = SpliterMut<'a, T>;
+        type Item = &'a mut T;
 
         #[inline]
-        fn spliter(self) -> Self::I {
+        fn into_spliterator(self) -> Self::I {
             SpliterMut { inner: self.iter_mut() }
         }
     }
@@ -117,20 +152,22 @@ pub mod vec {
 
     impl<'a, T, A: Alloc> IntoSpliterator for &'a Vec<T, A> {
         type I = super::slice::Spliter<'a, T>;
+        type Item = &'a T;
 
         #[inline]
-        fn spliter(self) -> Self::I {
-            (&** self).spliter()
+        fn into_spliterator(self) -> Self::I {
+            (&**self).into_spliterator()
         }
     }
 
 
     impl<'a, T, A: Alloc> IntoSpliterator for &'a mut Vec<T, A> {
         type I = super::slice::SpliterMut<'a, T>;
+        type Item = &'a mut T;
 
         #[inline]
-        fn spliter(self) -> Self::I {
-            (&mut **self).spliter()
+        fn into_spliterator(self) -> Self::I {
+            (&mut **self).into_spliterator()
         }
     }
 

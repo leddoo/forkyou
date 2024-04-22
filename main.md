@@ -1,7 +1,5 @@
 
 - todo:
-    - map rework.
-        - `[MaybeUninit<U>]`.
     - wake more workers.
     - work stealing.
     - wake fewer workers.
