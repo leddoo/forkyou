@@ -17,7 +17,7 @@ pub(crate) struct Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        Runtime::get().worker_exit();
+        Runtime::worker_exit();
     }
 }
 
@@ -35,6 +35,10 @@ impl Worker {
             });
 
             Self::main(Self::current());
+
+            WORKER.with(|ptr| {
+                ptr.set(core::ptr::null_mut());
+            });
         }));
 
         return sleeper;
@@ -57,7 +61,8 @@ impl Worker {
     }
 
     #[inline]
-    pub unsafe fn push_task(&self, task: Task) {
+    pub fn push_task(&self, task: Task) {
+        debug_assert!(core::ptr::eq(self, Worker::current()));
         unsafe { self.deque.push(task) }
     }
 
@@ -93,7 +98,7 @@ impl Worker {
         }
     }
 
-    fn find_task(&self, rt: &Runtime) -> Option<Task> {
+    pub fn find_task(&self, rt: &Runtime) -> Option<Task> {
         if let Some(task) = unsafe { self.deque.pop() } {
             return Some(task);
         }

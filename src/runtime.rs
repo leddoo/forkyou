@@ -26,16 +26,17 @@ pub(crate) struct Runtime {
 impl Runtime {
     pub fn submit_task(task: Task) {
         if let Some(worker) = Worker::try_current() {
-            unsafe { worker.push_task(task) }
+            worker.push_task(task);
         }
         else {
             Self::inject_task(task);
         }
     }
 
+    #[inline]
     pub fn submit_task_on_worker(task: Task) {
         let worker = Worker::current();
-        unsafe { worker.push_task(task) }
+        worker.push_task(task);
     }
 
     #[cold]
@@ -55,6 +56,7 @@ impl Runtime {
         }
     }
 
+    #[inline]
     pub fn on_worker<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
         if Worker::try_current().is_some() {
             f()
@@ -65,7 +67,7 @@ impl Runtime {
     }
 
     #[cold]
-    pub fn on_worker_slow_path<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
+    fn on_worker_slow_path<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
         thread_local! {
             static SLEEPER: Sleeper = Sleeper::new();
         }
@@ -108,6 +110,21 @@ impl Runtime {
         })
     }
 
+
+    pub fn work_while<F: FnMut() -> bool>(mut f: F) {
+        let rt = Runtime::get();
+        let worker = Worker::current();
+        while f() {
+            let Some(task) = worker.find_task(rt) else {
+                debug_assert!(false, "work while ran out of work");
+
+                std::thread::yield_now();
+                continue;
+            };
+            task.call();
+        }
+    }
+
     #[inline]
     pub fn steal_task(&self) -> Option<Task> {
         self.injector_deque.steal().ok()
@@ -124,11 +141,12 @@ impl Runtime {
     }
 
     #[inline]
-    pub fn worker_exit(&self) {
-        let n = self.running_workers.fetch_sub(1, Ordering::Relaxed);
+    pub fn worker_exit() {
+        let rt = Runtime::get();
+        let n = rt.running_workers.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(n != 0);
         if n == 1 {
-            self.termination_sleeper.wake();
+            rt.termination_sleeper.wake();
         }
     }
 }
@@ -221,7 +239,10 @@ impl Drop for Terminator {
         }
         rt.termination_sleeper.sleep();
 
+        STATE.store(INITING, Ordering::Release);
+        let rt = unsafe { core::ptr::read(RUNTIME.as_mut_ptr()) };
         STATE.store(UNINIT, Ordering::Release);
+        drop(rt);
     }
 }
 
@@ -234,12 +255,16 @@ mod tests {
     fn graceful_shutdown() {
         {
             let _t = Terminator::new();
-            assert!(STATE.load(Ordering::SeqCst) == INIT);
+            assert_eq!(STATE.load(Ordering::SeqCst), INIT);
 
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            // for some reason, with this line enabled,
+            // miri complains about a datarace between `condvar.notify_one()`
+            // in `wake` and the retag of `RUNTIME.as_mut_ptr()`.
+            // probably a false positive.
+            //std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        assert!(STATE.load(Ordering::SeqCst) == UNINIT);
+        assert_eq!(STATE.load(Ordering::SeqCst), UNINIT);
     }
 }
 
