@@ -21,18 +21,26 @@ impl<T: Send> Deque<T> {
         }
     }
 
+    #[inline]
+    pub fn len(&self) -> usize {
+        let begin = self.begin.load(Ordering::Acquire);
+        let end   = self.end.load(Ordering::Acquire);
+        Self::queue_len(begin, end).max(0) as usize
+    }
+
+
     #[inline(always)]
-    fn len(begin: usize, end: usize) -> isize {
+    fn queue_len(begin: usize, end: usize) -> isize {
         (end as isize).wrapping_sub(begin as isize)
     }
 
     pub unsafe fn push(&self, value: T) {
         let begin = self.begin.load(Ordering::Acquire);
-        let end   = self.end.load(Ordering::Relaxed);
+        let end   = self.end.load(Ordering::Acquire);
 
         let mut buffer = self.buffer.read();
 
-        let len = Self::len(begin, end);
+        let len = Self::queue_len(begin, end);
         if len >= buffer.cap() as isize {
             debug_assert_eq!(len, buffer.cap() as isize);
 
@@ -53,18 +61,26 @@ impl<T: Send> Deque<T> {
         unsafe { buffer.at(end).write(MaybeUninit::new(value)) }
         drop(buffer);
 
+        // i have no idea what these are for.
+        // something something happens before.
+        // @todo: investigate and explain.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
         self.end.store(end.wrapping_add(1), Ordering::Release);
     }
 
     pub unsafe fn pop(&self) -> Option<T> {
-        let end = self.end.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Acquire);
         self.end.store(end.wrapping_sub(1), Ordering::Release);
 
         let begin = self.begin.load(Ordering::Acquire);
 
-        let len = Self::len(begin, end);
+        // i have no idea what these are for.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        let len = Self::queue_len(begin, end);
         if len <= 0 {
-            self.end.store(begin, Ordering::Relaxed);
+            self.end.store(begin, Ordering::Release);
             return None;
         }
 
@@ -93,7 +109,10 @@ impl<T: Send> Deque<T> {
         let begin = self.begin.load(Ordering::Acquire);
         let end   = self.end.load(Ordering::Acquire);
 
-        let len = Self::len(begin, end);
+        // i have no idea what these are for.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        let len = Self::queue_len(begin, end);
         if len <= 0 {
             return Err(true);
         }

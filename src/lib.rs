@@ -18,6 +18,8 @@ pub use state_cache::StateCache;
 mod runtime;
 mod worker;
 
+pub use runtime::Terminator;
+
 
 // temp sti stuff:
 type CovariantLifetime<'a>     = PhantomData<fn()       -> &'a ()>;
@@ -388,6 +390,8 @@ mod tests {
 
     #[test]
     fn untracked() {
+        let _t = super::Terminator::new();
+
         let result = Arc::new(Mutex::new(None));
 
         super::spawn_untracked(sti::enclose!(result; move || {
@@ -408,6 +412,8 @@ mod tests {
 
     #[test]
     fn scoped() {
+        assert!(false, "temp");
+
         let the_result = 42;
         let result = super::scope(|scope| {
             let result = &*scope.alloc().alloc_new(SpinLock::new(None));
@@ -425,6 +431,8 @@ mod tests {
 
     #[test]
     fn nested_scopes() {
+        assert!(false, "temp");
+
         let result = super::scope(|scope| {
             assert_eq!(scope.alloc().stats().total_allocated, super::SCOPE_ARENA_INITIAL_SIZE);
 
@@ -457,6 +465,8 @@ mod tests {
 
     #[test]
     fn for_each() {
+        assert!(false, "temp");
+
         let mut values = Vec::from_iter(0..100);
 
         let result = AtomicU32::new(0);
@@ -476,6 +486,8 @@ mod tests {
 
     #[test]
     fn map() {
+        assert!(false, "temp");
+
         let values = Vec::from_iter(0..100);
 
         let squared = super::map(&values, |v| *v * *v);

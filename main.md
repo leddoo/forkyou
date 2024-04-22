@@ -1,7 +1,9 @@
 
 - "the runtime stuff".
     - fix scope.
-    - shut down workers, somehow.
+    - untracked tasks block terminator.
+        - check if terminator present, then fetchadd untracked counter.
+    - wake more workers.
     - work stealing.
 
 - todo:
@@ -13,4 +15,5 @@
     - test lying spliterator.
 
 - panic handling.
+    - and abort on unwind inside lib.
 

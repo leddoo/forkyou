@@ -1,8 +1,9 @@
 use sti::vec::Vec;
 use std::sync::{Arc, Mutex};
 use core::mem::{MaybeUninit, ManuallyDrop};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use core::ptr::NonNull;
+use core::marker::PhantomData;
 
 use crate::Task;
 use crate::deque::Deque;
@@ -10,6 +11,12 @@ use crate::worker::{Worker, Sleeper};
 
 
 pub(crate) struct Runtime {
+    has_terminator: AtomicBool,
+    terminating: AtomicBool,
+
+    termination_sleeper: Sleeper,
+    running_workers: AtomicU32,
+
     sleepers: Vec<Arc<Sleeper>>,
 
     injector_mutex: Mutex<()>,
@@ -105,6 +112,25 @@ impl Runtime {
     pub fn steal_task(&self) -> Option<Task> {
         self.injector_deque.steal().ok()
     }
+
+    #[inline]
+    pub fn terminating(&self) -> bool {
+        self.terminating.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn tasks_pending(&self) -> bool {
+        self.injector_deque.len() > 0
+    }
+
+    #[inline]
+    pub fn worker_exit(&self) {
+        let n = self.running_workers.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(n != 0);
+        if n == 1 {
+            self.termination_sleeper.wake();
+        }
+    }
 }
 
 
@@ -121,7 +147,7 @@ impl Runtime {
     pub fn get() -> &'static Self {
         let s = STATE.load(Ordering::Acquire);
         if s == INIT {
-            return unsafe { &mut *RUNTIME.as_mut_ptr() };
+            return unsafe { &*RUNTIME.as_ptr() };
         }
 
         return Self::get_slow_path();
@@ -141,15 +167,21 @@ impl Runtime {
             }
         }
 
-        return unsafe { &mut *RUNTIME.as_mut_ptr() };
+        return unsafe { &*RUNTIME.as_ptr() };
     }
 
     #[cold]
     fn init() -> Self {
+        let num_workers = crate::ncpu() as u32;
+
         let sleepers = Vec::from_iter(
-            (0..crate::ncpu()).map(|_| { Worker::spawn() }));
+            (0..num_workers).map(|_| { Worker::spawn() }));
 
         Self {
+            has_terminator: AtomicBool::new(false),
+            terminating: AtomicBool::new(false),
+            termination_sleeper: Sleeper::new(),
+            running_workers: AtomicU32::new(num_workers),
             sleepers,
             injector_mutex: Mutex::new(()),
             injector_deque: Deque::new(),
@@ -158,13 +190,56 @@ impl Runtime {
 }
 
 
+pub struct Terminator {
+    _unsend: PhantomData<*mut ()>,
+}
+
+impl Terminator {
+    pub fn new() -> Self {
+        if Worker::try_current().is_some() {
+            panic!("terminator on worker");
+        }
+
+        let rt = Runtime::get();
+        if rt.has_terminator.swap(true, Ordering::SeqCst) {
+            panic!("multiple terminators");
+        }
+
+        Terminator { _unsend: PhantomData }
+    }
+}
+
+impl Drop for Terminator {
+    fn drop(&mut self) {
+        let rt = Runtime::get();
+        debug_assert!(rt.has_terminator.load(Ordering::SeqCst));
+
+        rt.termination_sleeper.prime();
+        rt.terminating.store(true, Ordering::Release);
+        for sleeper in rt.sleepers.iter() {
+            sleeper.wake();
+        }
+        rt.termination_sleeper.sleep();
+
+        STATE.store(UNINIT, Ordering::Release);
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
+    use super::{Terminator, Ordering, STATE, INIT, UNINIT};
 
     #[test]
-    fn test() {
-        Runtime::get();
+    fn graceful_shutdown() {
+        {
+            let _t = Terminator::new();
+            assert!(STATE.load(Ordering::SeqCst) == INIT);
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(STATE.load(Ordering::SeqCst) == UNINIT);
     }
 }
 
