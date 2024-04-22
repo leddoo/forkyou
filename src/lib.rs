@@ -1,13 +1,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use sti::alloc::{Alloc, GlobalAlloc};
-use sti::arena::Arena;
 use sti::boks::Box;
 use sti::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::ptr::NonNull;
-use core::cell::UnsafeCell;
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::ManuallyDrop;
 use core::marker::PhantomData;
 
 pub mod deque;
@@ -59,8 +56,11 @@ use runtime::Runtime;
 pub fn ncpu() -> usize {
     thread_local! {
         static NCPU: usize =
-            std::thread::available_parallelism()
-                .map_or(1, |n| n.get())
+            if cfg!(not(miri)) {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+            }
+            else { 4 };
     }
 
     NCPU.with(|ncpu| *ncpu)
@@ -171,6 +171,7 @@ pub fn map_into<A: Alloc, T: Sync, U: Send, F: Fn(&T) -> U + Sync>(out: &mut Vec
 
 /// tasks can borrow locals from parent.
 /// ```rust
+/// let _t = forkyou::Terminator::new();
 /// let foo = 42;
 /// forkyou::scope(|scope| {
 ///     scope.spawn(|| foo);
@@ -188,6 +189,7 @@ pub fn map_into<A: Alloc, T: Sync, U: Send, F: Fn(&T) -> U + Sync>(out: &mut Vec
 ///
 /// scope can assign locals from parent.
 /// ```rust
+/// let _t = forkyou::Terminator::new();
 /// let mut foo = None;
 /// forkyou::scope(|scope| {
 ///     foo = Some(42);
@@ -196,6 +198,7 @@ pub fn map_into<A: Alloc, T: Sync, U: Send, F: Fn(&T) -> U + Sync>(out: &mut Vec
 ///
 /// single task can assign locals from parent.
 /// ```rust
+/// let _t = forkyou::Terminator::new();
 /// let mut foo = None;
 /// forkyou::scope(|scope| {
 ///     scope.spawn(|| foo = Some(42));

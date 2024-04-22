@@ -1,7 +1,9 @@
+use sti::alloc::GlobalAlloc;
+use sti::boks::Box;
 use sti::vec::Vec;
 use std::sync::{Arc, Mutex};
 use core::mem::{MaybeUninit, ManuallyDrop};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
 use core::ptr::NonNull;
 use core::marker::PhantomData;
 
@@ -14,7 +16,7 @@ pub(crate) struct Runtime {
     has_terminator: AtomicBool,
     terminating: AtomicBool,
 
-    termination_sleeper: Sleeper,
+    termination_sleeper: Arc<Sleeper>,
     running_workers: AtomicU32,
 
     sleepers: Vec<Arc<Sleeper>>,
@@ -41,7 +43,7 @@ impl Runtime {
 
     #[cold]
     pub fn inject_task(task: Task) {
-        let this = Self::get();
+        let this = Runtime::get();
 
         unsafe {
             let guard = this.injector_mutex.lock();
@@ -62,7 +64,7 @@ impl Runtime {
             f()
         }
         else {
-            Self::on_worker_slow_path(f)
+            Runtime::on_worker_slow_path(f)
         }
     }
 
@@ -118,7 +120,7 @@ impl Runtime {
             let Some(task) = worker.find_task(rt) else {
                 debug_assert!(false, "work while ran out of work");
 
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             };
             task.call();
@@ -143,16 +145,30 @@ impl Runtime {
     #[inline]
     pub fn worker_exit() {
         let rt = Runtime::get();
-        let n = rt.running_workers.fetch_sub(1, Ordering::Relaxed);
+
+        let n = rt.running_workers.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(n != 0);
+
+        // not sure this is necessary.
+        // without it, miri complains about `Runtime::get()`
+        // racing with the `drop(rt)` in `Terminator::drop`.
+        // it shouldn't be a problem cause clearly we need to get
+        // the runtime, before we can signal the termination sleeper.
+        // but since we're not on any hot path here, we'll do as miri says.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
         if n == 1 {
-            rt.termination_sleeper.wake();
+            // `rt` is dropped by the `wake` call,
+            // so we can't keep any refs into it (`termination_sleeper`),
+            // even if we don't use them anymore (strong protectors).
+            let sleeper = rt.termination_sleeper.clone();
+            sleeper.wake();
         }
     }
 }
 
 
-static mut RUNTIME: MaybeUninit<Runtime> = MaybeUninit::uninit();
+static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(core::ptr::null_mut());
 
 static STATE: AtomicU8 = AtomicU8::new(UNINIT);
 
@@ -162,30 +178,38 @@ const INIT: u8 = 2;
 
 impl Runtime {
     #[inline]
-    pub fn get() -> &'static Self {
-        let s = STATE.load(Ordering::Acquire);
-        if s == INIT {
-            return unsafe { &*RUNTIME.as_ptr() };
+    pub fn get() -> &'static Runtime {
+        let p = RUNTIME.load(Ordering::Acquire);
+        if !p.is_null() {
+            return unsafe { &*p };
         }
 
-        return Self::get_slow_path();
+        return Runtime::get_slow_path();
     }
 
-    fn get_slow_path() -> &'static Self {
+    #[cold]
+    fn get_slow_path() -> &'static Runtime {
+        // syncs with terminator drop.
+        // again, this is mostly to please miri.
+        // in a real program, this is only executed once.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
         if STATE.compare_exchange(
             UNINIT, INITING,
             Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
-            unsafe { RUNTIME = MaybeUninit::new(Self::init()) };
+            let ptr = Box::new(Runtime::init()).into_raw_parts().0;
+            RUNTIME.store(ptr.as_ptr(), Ordering::Release);
             STATE.store(INIT, Ordering::Release);
         }
         else {
-            while STATE.load(Ordering::Acquire) != INIT {
-                std::thread::yield_now();
+            while STATE.load(Ordering::Acquire) == INITING {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            assert_eq!(STATE.load(Ordering::Acquire), INIT);
         }
 
-        return unsafe { &*RUNTIME.as_ptr() };
+        return unsafe { &*RUNTIME.load(Ordering::Acquire) };
     }
 
     #[cold]
@@ -198,7 +222,7 @@ impl Runtime {
         Self {
             has_terminator: AtomicBool::new(false),
             terminating: AtomicBool::new(false),
-            termination_sleeper: Sleeper::new(),
+            termination_sleeper: Arc::new(Sleeper::new()),
             running_workers: AtomicU32::new(num_workers),
             sleepers,
             injector_mutex: Mutex::new(()),
@@ -239,10 +263,23 @@ impl Drop for Terminator {
         }
         rt.termination_sleeper.sleep();
 
+        // refer to the comment in worker_exit.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let n = rt.running_workers.load(Ordering::SeqCst);
+        assert_eq!(n, 0);
+
+
         STATE.store(INITING, Ordering::Release);
-        let rt = unsafe { core::ptr::read(RUNTIME.as_mut_ptr()) };
+        let rt = unsafe {
+            let ptr = RUNTIME.swap(core::ptr::null_mut(), Ordering::SeqCst);
+            let ptr = NonNull::new(ptr).unwrap();
+            Box::from_raw_parts(ptr, GlobalAlloc)
+        };
         STATE.store(UNINIT, Ordering::Release);
         drop(rt);
+
+        // refer to the comment in get_slow_path.
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 }
 
@@ -256,12 +293,6 @@ mod tests {
         {
             let _t = Terminator::new();
             assert_eq!(STATE.load(Ordering::SeqCst), INIT);
-
-            // for some reason, with this line enabled,
-            // miri complains about a datarace between `condvar.notify_one()`
-            // in `wake` and the retag of `RUNTIME.as_mut_ptr()`.
-            // probably a false positive.
-            //std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         assert_eq!(STATE.load(Ordering::SeqCst), UNINIT);
