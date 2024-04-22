@@ -1,11 +1,10 @@
 
 - todo:
-    - spliterator & map rework.
-        - len, split.
+    - map rework.
         - `[MaybeUninit<U>]`.
     - wake more workers.
     - work stealing.
-    - wake less workers.
+    - wake fewer workers.
     - untracked tasks block terminator.
         - check if terminator present, then fetchadd untracked counter.
     - panic handling.

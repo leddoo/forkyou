@@ -147,7 +147,7 @@ impl Runtime {
         let rt = Runtime::get();
 
         let n = rt.running_workers.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(n != 0);
+        assert!(n != 0);
 
         // not sure this is necessary.
         // without it, miri complains about `Runtime::get()`

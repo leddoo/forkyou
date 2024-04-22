@@ -9,8 +9,10 @@ use core::marker::PhantomData;
 
 pub mod deque;
 pub mod state_cache;
+pub mod spliterator;
 
 pub use state_cache::StateCache;
+pub use spliterator::{Spliterator, IntoSpliterator};
 
 mod runtime;
 mod worker;
