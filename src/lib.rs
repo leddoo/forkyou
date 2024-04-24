@@ -42,18 +42,39 @@ fn box_into_inner<T, A: Alloc>(this: Box<T, A>) -> T {
 }
 
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SendPtr<T>(pub *const T);
+#[derive(Clone, Copy, Debug)]
+struct XorShift32 {
+    pub state: u32,
+}
 
-unsafe impl<T> Sync for SendPtr<T> {}
-unsafe impl<T> Send for SendPtr<T> {}
+impl XorShift32 {
+    #[inline]
+    pub fn new() -> Self {
+        // pi in fixed point.
+        Self { state: 0x517cc1b7 }
+    }
 
+    #[inline]
+    pub fn from_seed(seed: u32) -> Self {
+        Self { state: seed }
+    }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SendPtrMut<T>(pub *mut T);
+    #[inline]
+    pub fn next(&mut self) -> u32 {
+        /* Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs" */
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        return x;
+    }
 
-unsafe impl<T> Sync for SendPtrMut<T> {}
-unsafe impl<T> Send for SendPtrMut<T> {}
+    #[inline]
+    pub fn next_n(&mut self, n: u32) -> u32 {
+        ((self.next() as u64 * n as u64) >> 32) as u32
+    }
+}
 
 
 

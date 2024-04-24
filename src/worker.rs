@@ -1,47 +1,50 @@
 use sti::mem::Cell;
 use std::sync::{Arc, Mutex, Condvar};
 
-use crate::{Task, Runtime};
+use crate::{Task, Runtime, XorShift32};
 use crate::deque::Deque;
 
 
 
 thread_local! {
-    static WORKER: Cell<*mut Worker> = Cell::new(core::ptr::null_mut());
+    static WORKER: Cell<*const Worker> = Cell::new(core::ptr::null());
 }
 
 pub(crate) struct Worker {
-    sleeper: Arc<Sleeper>,
+    sleeper: Sleeper,
     deque: Deque<Task>,
+    steal_rng: Cell<XorShift32>,
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        Runtime::worker_exit();
-    }
-}
+unsafe impl Sync for Worker {}
 
 impl Worker {
-    pub fn spawn() -> Arc<Sleeper> {
-        let sleeper = Arc::new(Sleeper::new());
+    pub fn spawn() -> Arc<Worker> {
+        let worker = Arc::new(Worker {
+            sleeper: Sleeper::new(),
+            deque: Deque::new(),
+            steal_rng: Cell::new(XorShift32::new()),
+        });
 
-        std::thread::spawn(sti::enclose!(sleeper; || {
-            let mut dont_touch_this = Worker {
-                sleeper,
-                deque: Deque::new(),
-            };
+        worker.steal_rng.set(XorShift32::from_seed(
+            sti::hash::fxhash::fxhash32(&(worker.as_ref() as *const _))));
+
+        std::thread::spawn(sti::enclose!(worker; move || {
             WORKER.with(|ptr| {
-                ptr.set(&mut dont_touch_this);
+                ptr.set(&*worker);
             });
 
+            // @panic
             Self::main(Self::current());
 
             WORKER.with(|ptr| {
-                ptr.set(core::ptr::null_mut());
+                ptr.set(core::ptr::null());
             });
+
+            Runtime::worker_exit();
         }));
 
-        return sleeper;
+        return worker;
     }
 
     #[inline]
@@ -61,9 +64,48 @@ impl Worker {
     }
 
     #[inline]
+    fn find_task(&self, rt: &Runtime) -> Option<Task> {
+        let task = unsafe { self.deque.pop() };
+        if task.is_some() { return task }
+
+        let mut rng = self.steal_rng.get();
+        let task = rt.steal_task(&mut rng, self);
+        self.steal_rng.set(rng);
+        if task.is_some() { return task }
+
+        return None;
+    }
+
+    pub fn work_while<F: FnMut() -> bool>(&self, mut f: F) {
+        debug_assert!(core::ptr::eq(self, Worker::current()));
+
+        let rt = Runtime::get();
+        while f() {
+            let Some(task) = self.find_task(rt) else {
+                debug_assert!(false, "work while ran out of work");
+
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+            task.call();
+        }
+    }
+
+    #[inline]
     pub fn push_task(&self, task: Task) {
         debug_assert!(core::ptr::eq(self, Worker::current()));
         unsafe { self.deque.push(task) }
+    }
+
+    #[inline]
+    pub fn steal_from(&self) -> Result<Task, bool> {
+        debug_assert!(!core::ptr::eq(self, Worker::current()));
+        self.deque.steal()
+    }
+
+    #[inline]
+    pub fn wake(&self) -> bool {
+        self.sleeper.wake()
     }
 
     fn main(&self) {
@@ -96,18 +138,6 @@ impl Worker {
 
             self.sleeper.sleep();
         }
-    }
-
-    pub fn find_task(&self, rt: &Runtime) -> Option<Task> {
-        if let Some(task) = unsafe { self.deque.pop() } {
-            return Some(task);
-        }
-
-        if let Some(task) = rt.steal_task() {
-            return Some(task);
-        }
-
-        return None;
     }
 }
 

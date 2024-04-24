@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
 use core::ptr::NonNull;
 use core::marker::PhantomData;
 
-use crate::Task;
+use crate::{Task, XorShift32};
 use crate::deque::Deque;
 use crate::worker::{Worker, Sleeper};
 
@@ -18,7 +18,7 @@ pub(crate) struct Runtime {
     termination_sleeper: Arc<Sleeper>,
     running_workers: AtomicU32,
 
-    sleepers: Vec<Arc<Sleeper>>,
+    workers: Vec<Arc<Worker>>,
 
     injector_mutex: Mutex<()>,
     injector_deque: Deque<Task>,
@@ -50,8 +50,8 @@ impl Runtime {
             drop(guard);
         }
 
-        for sleeper in this.sleepers.iter() {
-            if sleeper.wake() {
+        for worker in this.workers.iter() {
+            if worker.wake() {
                 break;
             }
         }
@@ -111,22 +111,31 @@ impl Runtime {
     }
 
 
-    pub fn work_while<F: FnMut() -> bool>(mut f: F) {
-        let rt = Runtime::get();
-        let worker = Worker::current();
-        while f() {
-            let Some(task) = worker.find_task(rt) else {
-                debug_assert!(false, "work while ran out of work");
-
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            };
-            task.call();
-        }
+    #[inline]
+    pub fn work_while<F: FnMut() -> bool>(f: F) {
+        Worker::current().work_while(f);
     }
 
-    #[inline]
-    pub fn steal_task(&self) -> Option<Task> {
+    pub fn steal_task(&self, rng: &mut XorShift32, exclude: *const Worker) -> Option<Task> {
+        let mut retry = true;
+        while retry {
+            retry = false;
+
+            let mut at = rng.next_n(self.workers.len() as u32) as usize;
+            for _ in 0..self.workers.len() {
+                let worker = &self.workers[at];
+                if worker.as_ref() as *const _ != exclude {
+                    match worker.steal_from() {
+                        Ok(task) => return Some(task),
+                        Err(empty) => retry |= !empty,
+                    }
+                }
+
+                at += 1;
+                if at == self.workers.len() { at = 0; }
+            }
+        }
+
         self.injector_deque.steal().ok()
     }
 
@@ -214,7 +223,7 @@ impl Runtime {
     fn init() -> Self {
         let num_workers = crate::ncpu() as u32;
 
-        let sleepers = Vec::from_iter(
+        let workers = Vec::from_iter(
             (0..num_workers).map(|_| { Worker::spawn() }));
 
         Self {
@@ -222,7 +231,7 @@ impl Runtime {
             terminating: AtomicBool::new(false),
             termination_sleeper: Arc::new(Sleeper::new()),
             running_workers: AtomicU32::new(num_workers),
-            sleepers,
+            workers,
             injector_mutex: Mutex::new(()),
             injector_deque: Deque::new(),
         }
@@ -256,8 +265,8 @@ impl Drop for Terminator {
 
         rt.termination_sleeper.prime();
         rt.terminating.store(true, Ordering::Release);
-        for sleeper in rt.sleepers.iter() {
-            sleeper.wake();
+        for worker in rt.workers.iter() {
+            worker.wake();
         }
         rt.termination_sleeper.sleep();
 
