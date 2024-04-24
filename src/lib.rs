@@ -14,7 +14,6 @@ pub use state_cache::StateCache;
 pub use spliterator::{Spliterator, IntoSpliterator, IntoSpliteratorRef, IntoSpliteratorRefMut};
 
 mod runtime;
-mod worker;
 mod untracked;
 mod scope;
 mod join;
