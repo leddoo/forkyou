@@ -1,4 +1,4 @@
-use crate::Spliterator;
+use crate::{Runtime, Spliterator, join_on_worker};
 
 
 #[inline]
@@ -8,12 +8,27 @@ where
     I: Spliterator<Item = T> + Send,
     F: Fn(T) + Send + Sync
 {
-    let dst = unsafe {
-        core::slice::from_raw_parts_mut(
-            core::ptr::NonNull::dangling().as_ptr(),
-            iter.len())
-    };
-    crate::map_core(iter, dst, f)
+    let f = &f;
+    Runtime::on_worker(move || for_each_core(iter, f))
+}
+
+#[inline]
+fn for_each_core<T, I, F>(mut iter: I, f: &F)
+where
+    T: Send,
+    I: Spliterator<Item = T> + Send,
+    F: Fn(T) + Send + Sync
+{
+    if iter.len() >= 2 {
+        let mid = iter.len() / 2;
+        let (lhs, rhs) = iter.split(mid);
+        join_on_worker(
+            move || for_each_core(lhs, f),
+            move || for_each_core(rhs, f));
+    }
+    else if iter.len() == 1 {
+        f(iter.next());
+    }
 }
 
 

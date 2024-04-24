@@ -1,4 +1,3 @@
-use sti::alloc::GlobalAlloc;
 use sti::boks::Box;
 use sti::vec::Vec;
 use std::sync::{Arc, Mutex};
@@ -75,21 +74,21 @@ impl Runtime {
         }
 
         SLEEPER.with(|sleeper| {
-            struct FBox<'a, R, F> {
+            struct StackTask<'a, R, F> {
                 f: ManuallyDrop<F>,
-                sleeper: &'a Sleeper,
                 result: MaybeUninit<R>,
+                sleeper: &'a Sleeper,
             }
 
-            let mut fbox = FBox {
+            let mut task = StackTask {
                 f: ManuallyDrop::new(f),
-                sleeper,
                 result: MaybeUninit::uninit(),
+                sleeper,
             };
 
-            let ptr = NonNull::from(&mut fbox).cast();
+            let ptr = NonNull::from(&mut task).cast();
             let call = |ptr: NonNull<u8>| {
-                let ptr = ptr.cast::<FBox<R, F>>().as_ptr();
+                let ptr = ptr.cast::<StackTask<R, F>>().as_ptr();
                 let fbox = unsafe { &mut *ptr };
 
                 // @panic.
@@ -103,12 +102,11 @@ impl Runtime {
 
             sleeper.prime();
 
-            let task = unsafe { Task::new(ptr, call) };
-            Runtime::inject_task(task);
+            Runtime::inject_task(unsafe { Task::new(ptr, call) });
 
             sleeper.sleep();
 
-            return unsafe { fbox.result.assume_init() };
+            return unsafe { task.result.assume_init() };
         })
     }
 
@@ -198,7 +196,7 @@ impl Runtime {
             UNINIT, INITING,
             Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
-            let ptr = Box::new(Runtime::init()).into_raw_parts().0;
+            let ptr = Box::new(Runtime::init()).into_raw_parts();
             RUNTIME.store(ptr.as_ptr(), Ordering::Release);
             STATE.store(INIT, Ordering::Release);
         }
@@ -273,7 +271,7 @@ impl Drop for Terminator {
         let rt = unsafe {
             let ptr = RUNTIME.swap(core::ptr::null_mut(), Ordering::SeqCst);
             let ptr = NonNull::new(ptr).unwrap();
-            Box::from_raw_parts(ptr, GlobalAlloc)
+            Box::from_raw_parts(ptr)
         };
         STATE.store(UNINIT, Ordering::Release);
         drop(rt);

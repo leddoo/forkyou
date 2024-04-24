@@ -1,8 +1,8 @@
 
 - todo:
-    - wake more workers.
-    - work stealing.
-    - wake fewer workers.
+    - wake more workers & work stealing.
+    - move stuff into sti.
+    - sti mem imports.
     - untracked tasks block terminator.
         - check if terminator present, then fetchadd untracked counter.
     - panic handling.

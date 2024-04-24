@@ -1,88 +1,8 @@
 use sti::alloc::{Alloc, GlobalAlloc};
 use sti::vec::Vec;
-use core::mem::{MaybeUninit, ManuallyDrop};
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::mem::MaybeUninit;
 
-use crate::{Runtime, Task, Spliterator};
-
-
-pub fn map_core<T, U, I, F>(iter: I, result: &mut [MaybeUninit<U>], f: F)
-where
-    T: Send,
-    U: Send,
-    I: Spliterator<Item = T> + Send,
-    F: Fn(T) -> U + Send + Sync
-{
-    Runtime::on_worker(move || {
-        map_core_core(iter, result, &f)
-    })
-}
-
-fn map_core_core<T, U, I, F>(mut iter: I, result: &mut [MaybeUninit<U>], f: &F)
-where
-    T: Send,
-    U: Send,
-    I: Spliterator<Item = T> + Send,
-    F: Fn(T) -> U + Send + Sync
-{
-    assert_eq!(iter.len(), result.len());
-
-    if iter.len() >= 2 {
-        let mid = iter.len() / 2;
-        let (lhs, rhs) = iter.split(mid);
-        let (lhs_result, rhs_result) = result.split_at_mut(mid);
-
-
-        const STATE_WAIT: u8 = 0;
-        const STATE_DONE: u8 = 1;
-        const STATE_PANIC: u8 = 2;
-
-        struct FBox<'a, U, I, F> {
-            iter: ManuallyDrop<I>,
-            result: &'a mut [MaybeUninit<U>],
-            f: &'a F,
-            state: &'a AtomicU8,
-        }
-
-        let state = AtomicU8::new(STATE_WAIT);
-
-        let mut fbox = FBox {
-            iter: ManuallyDrop::new(lhs),
-            result: lhs_result,
-            f,
-            state: &state,
-        };
-
-        let ptr = NonNull::from(&mut fbox).cast();
-
-        let call = |ptr: NonNull<u8>| {
-            let mut ptr = ptr.cast::<FBox<U, I, F>>();
-            let fbox = unsafe { ptr.as_mut() };
-            map_core_core(
-                unsafe { ManuallyDrop::take(&mut fbox.iter) },
-                &mut *fbox.result,
-                fbox.f);
-            fbox.state.store(STATE_DONE, Ordering::Release);
-        };
-
-        Runtime::submit_task_on_worker(unsafe {
-            Task::new(ptr, call)
-        });
-
-        map_core_core(rhs, rhs_result, f);
-
-        Runtime::work_while(|| state.load(Ordering::Acquire) == STATE_WAIT);
-
-        let state = state.load(Ordering::Acquire);
-        if state != STATE_DONE {
-            todo!()
-        }
-    }
-    else if iter.len() == 1 {
-        result[0] = MaybeUninit::new(f(iter.next()));
-    }
-}
+use crate::{Runtime, Spliterator, join_on_worker};
 
 
 #[inline]
@@ -131,6 +51,39 @@ where
     unsafe { result.set_len(result.len() + len) }
 }
 
+#[inline]
+pub fn map_core<T, U, I, F>(iter: I, result: &mut [MaybeUninit<U>], f: F)
+where
+    T: Send,
+    U: Send,
+    I: Spliterator<Item = T> + Send,
+    F: Fn(T) -> U + Send + Sync
+{
+    let f = &f;
+    Runtime::on_worker(move || map_core_core(iter, result, f))
+}
+
+fn map_core_core<T, U, I, F>(mut iter: I, result: &mut [MaybeUninit<U>], f: &F)
+where
+    T: Send,
+    U: Send,
+    I: Spliterator<Item = T> + Send,
+    F: Fn(T) -> U + Send + Sync
+{
+    assert_eq!(iter.len(), result.len());
+
+    if iter.len() >= 2 {
+        let mid = iter.len() / 2;
+        let (lhs, rhs) = iter.split(mid);
+        let (lhs_result, rhs_result) = result.split_at_mut(mid);
+        join_on_worker(
+            move || map_core_core(lhs, lhs_result, f),
+            move || map_core_core(rhs, rhs_result, f));
+    }
+    else if iter.len() == 1 {
+        result[0] = MaybeUninit::new(f(iter.next()));
+    }
+}
 
 
 #[cfg(test)]

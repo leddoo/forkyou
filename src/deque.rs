@@ -140,11 +140,10 @@ const MIN_CAP: usize = 16;
 
 impl<T> Buffer<T> {
     fn new() -> Self { unsafe {
-        use sti::alloc::GlobalAlloc;
         use core::ptr::NonNull;
         // @todo: box slice from fn.
         let slice = core::slice::from_raw_parts_mut(NonNull::dangling().as_ptr(), 0);
-        Self { inner: Box::from_raw_parts(NonNull::from(slice), GlobalAlloc) }
+        Self { inner: Box::from_raw_parts(NonNull::from(slice)) }
     }}
 
     #[inline(always)]
@@ -166,7 +165,7 @@ impl<T> Buffer<T> {
             use core::ptr::NonNull;
             let ptr = sti::alloc::alloc_array(&GlobalAlloc, new_cap).expect("oom");
             let slice = core::slice::from_raw_parts_mut(ptr.as_ptr(), new_cap);
-            Self { inner: Box::from_raw_parts(NonNull::from(slice), GlobalAlloc) }
+            Self { inner: Box::from_raw_parts(NonNull::from(slice)) }
         };
 
         let mut i = begin;

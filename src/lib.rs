@@ -17,12 +17,14 @@ mod runtime;
 mod worker;
 mod untracked;
 mod scope;
+mod join;
 mod map;
 mod for_each;
 
 pub use runtime::Terminator;
 pub use untracked::spawn_untracked;
 pub use scope::scope;
+pub use join::{join, join_on_worker};
 pub use map::{map, map_in, map_into, map_core};
 pub use for_each::for_each;
 
@@ -32,9 +34,9 @@ type CovariantLifetime<'a>     = PhantomData<fn()       -> &'a ()>;
 type ContravariantLifetime<'a> = PhantomData<fn(&'a ())>;
 type InvariantLifetime<'a>     = PhantomData<fn(&'a ()) -> &'a ()>;
 fn box_into_inner<T, A: Alloc>(this: Box<T, A>) -> T {
-    let (ptr, alloc) = this.into_raw_parts();
+    let (ptr, alloc) = this.into_raw_parts_in();
     let ptr = ptr.cast::<ManuallyDrop<T>>();
-    let mut this = unsafe { Box::from_raw_parts(ptr, alloc) };
+    let mut this = unsafe { Box::from_raw_parts_in(ptr, alloc) };
     let result = unsafe { ManuallyDrop::take(&mut *this) };
     return result;
 }

@@ -1,4 +1,4 @@
-use sti::cell::Cell;
+use sti::mem::Cell;
 use std::sync::{Arc, Mutex, Condvar};
 
 use crate::{Task, Runtime};

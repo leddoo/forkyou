@@ -1,13 +1,12 @@
-use sti::alloc::GlobalAlloc;
 use sti::boks::Box;
 use crate::{Runtime, Task, box_into_inner};
 
 
 pub fn spawn_untracked<F: FnOnce() + Send + 'static>(f: F) {
     let task = Task {
-        ptr: Box::new(f).into_raw_parts().0.cast(),
+        ptr: Box::new(f).into_raw_parts().cast(),
         call: |ptr| {
-            let f = unsafe { Box::from_raw_parts(ptr.cast(), GlobalAlloc) };
+            let f = unsafe { Box::from_raw_parts(ptr.cast()) };
             // @temp
             let f: F = box_into_inner(f); //f.into_inner();
             // @panic.
