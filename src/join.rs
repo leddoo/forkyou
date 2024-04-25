@@ -20,14 +20,9 @@ where F1: FnOnce() -> R1 + Send,
     // @panic.
     let r1 = f1();
 
-    let ok = f2.complete();
-    if ok {
-        let r2 = unsafe { f2.into_result() };
-        return (r1, r2);
-    }
-    else {
-        todo!()
-    }
+    let r2 = unsafe { f2.handle().join().expect("todo") };
+
+    return (r1, r2);
 }
 
 

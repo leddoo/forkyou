@@ -1,11 +1,9 @@
 use sti::arena::Arena;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use core::cell::UnsafeCell;
-use core::ptr::NonNull;
-use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::{CovariantLifetime, InvariantLifetime};
 
-use crate::{Runtime, Task};
+use crate::Runtime;
+use crate::runtime::{Latch, StackTask, StackTaskHandle};
 
 
 pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -> R {
@@ -29,7 +27,8 @@ pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -
                 alloc,
                 state: ScopeState {
                     panic: AtomicBool::new(false),
-                    running: AtomicUsize::new(0),
+                    running: AtomicUsize::new(1),
+                    latch: Latch::new_on_worker(),
                 },
                 _s: Default::default(),
                 _p: Default::default(),
@@ -37,8 +36,14 @@ pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -
 
             let result = f(&scope);
 
-            let running = &scope.state.running;
-            Runtime::work_while(|| running.load(Ordering::SeqCst) != 0);
+            if scope.state.running.fetch_sub(1, Ordering::AcqRel) != 1 {
+                let ok = scope.state.latch.wait();
+                assert!(ok);
+            }
+
+            if scope.state.panic.load(Ordering::Acquire) {
+                todo!()
+            }
 
             // safety:
             // - allocations cannot escape `f`, so there are no external dangling refs.
@@ -56,16 +61,17 @@ pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -
 
 pub struct Scope<'s, 'p: 's> {
     alloc: &'s Arena,
-    state: ScopeState,
+    state: ScopeState<'s>,
     _s: InvariantLifetime<'s>,
     _p: CovariantLifetime<'p>,
 }
 
 pub const SCOPE_ARENA_INITIAL_SIZE: usize = 64*1024;
 
-struct ScopeState {
+struct ScopeState<'s> {
     panic: AtomicBool,
     running: AtomicUsize,
+    latch: Latch<'s>
 }
 
 impl<'s, 'p: 's> Scope<'s, 'p> {
@@ -74,78 +80,39 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
     }
 
     pub fn spawn<R, F: FnOnce() -> R + Send + 'p>(&self, f: F) -> ScopeTask<'s, R> {
-        struct FBox<'a, R, F> {
-            f: F,
-            scope:  &'a ScopeState,
-            result: ScopeTaskResult<R>,
-        }
+        let state = unsafe { sti::erase!(&ScopeState, &self.state) };
 
-        let ptr: *mut FBox<R, F> = self.alloc.alloc_new(FBox {
-            f,
-            scope: &self.state,
-            result: ScopeTaskResult {
-                state: AtomicU8::new(RESULT_WAIT),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            },
-        });
+        let task = self.alloc.alloc_new(StackTask::new_on_worker(move || {
+            // @panic
+            let result = f();
 
-        let result = unsafe { &(*ptr).result };
+            let prev_running = state.running.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(prev_running > 0);
+            if prev_running == 1 {
+                state.latch.set(true);
+            }
 
-        let task = Task {
-            ptr: unsafe { NonNull::new_unchecked(ptr).cast() },
-            call: |ptr| {
-                let ptr = ptr.cast::<FBox<R, F>>().as_ptr();
-                let scope = unsafe { (*ptr).scope };
-                let result = unsafe { &(*ptr).result };
-                debug_assert_eq!(result.state.load(Ordering::SeqCst), RESULT_WAIT);
+            return result;
+        }));
 
-                let f = unsafe { (&mut (*ptr).f as *mut F).read() };
-                // @panic.
-                let value = f();
-
-                unsafe { result.value.get().write(MaybeUninit::new(value)) };
-                result.state.store(RESULT_DONE, Ordering::SeqCst);
-
-                let prev_running = scope.running.fetch_sub(1, Ordering::SeqCst);
-                debug_assert!(prev_running > 0);
-            },
-        };
-
-        let prev_running = self.state.running.fetch_add(1, Ordering::SeqCst);
+        let prev_running = self.state.running.fetch_add(1, Ordering::AcqRel);
         assert!(prev_running < usize::MAX);
 
-        Runtime::submit_task_on_worker(task);
+        Runtime::submit_task_on_worker(unsafe { task.create_task() });
 
-        return ScopeTask { result };
+        return ScopeTask { handle: task.handle() };
     }
 }
 
-const RESULT_WAIT: u8 = 0;
-const RESULT_DONE: u8 = 1;
-const RESULT_PANIC: u8 = 2;
-const RESULT_TAKEN: u8 = 3;
-
-struct ScopeTaskResult<R> {
-    state: AtomicU8,
-    value: UnsafeCell<MaybeUninit<R>>,
-}
 
 pub struct ScopeTask<'s, R> {
-    result: &'s ScopeTaskResult<R>,
+    handle: StackTaskHandle<'s, 's, R>,
 }
 
 impl<'s, R> ScopeTask<'s, R> {
+    #[inline]
     pub fn join(self) -> R {
-        let state = &self.result.state;
-        Runtime::work_while(|| state.load(Ordering::SeqCst) == RESULT_WAIT);
-
-        let state = state.load(Ordering::SeqCst);
-        if state == RESULT_DONE {
-            unsafe { self.result.value.get().read().assume_init() }
-        }
-        else {
-            todo!()
-        }
+        unsafe { self.handle.join().expect("todo") }
     }
 }
 

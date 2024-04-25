@@ -35,7 +35,7 @@ pub(crate) struct Runtime {
 
 impl Runtime {
     #[inline]
-    pub fn get() -> &'static Runtime {
+    fn get() -> &'static Runtime {
         let p = RUNTIME.load(Ordering::Acquire);
         if !p.is_null() {
             return unsafe { &*p };
@@ -139,22 +139,10 @@ impl Runtime {
         SLEEPER.with(|sleeper| {
             let task = StackTask::with_sleeper(sleeper, f);
             Runtime::inject_task(unsafe { task.create_task() });
-
-            let ok = task.complete();
-            if ok {
-                unsafe { task.into_result() }
-            }
-            else {
-                todo!()
-            }
+            unsafe { task.handle().join().expect("todo") }
         })
     }
 
-
-    #[inline]
-    pub fn work_while<F: FnMut() -> bool>(f: F) {
-        Worker::current().work_while(f);
-    }
 
     fn steal_task(&self, rng: &mut XorShift32, exclude: *const Worker) -> Option<Task> {
         let mut retry = true;
@@ -286,21 +274,6 @@ impl Worker {
         return None;
     }
 
-    fn work_while<F: FnMut() -> bool>(&self, mut f: F) {
-        debug_assert!(core::ptr::eq(self, Worker::current()));
-
-        let rt = Runtime::get();
-        while f() {
-            let Some(task) = self.find_task(rt) else {
-                debug_assert!(false, "work while ran out of work");
-
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            };
-            task.call();
-        }
-    }
-
     #[inline]
     fn push_task(&self, task: Task) {
         debug_assert!(core::ptr::eq(self, Worker::current()));
@@ -408,19 +381,24 @@ const LATCH_SLEEP: u8 = 1;
 const LATCH_READY: u8 = 2;
 const LATCH_PANIC: u8 = 3;
 
-struct Latch<'a> {
+pub(crate) struct Latch<'a> {
     state: AtomicU8,
     sleeper: &'a Sleeper,
 }
 
 impl<'a> Latch<'a> {
     #[inline]
-    fn new(sleeper: &'a Sleeper) -> Self {
+    pub fn new_on_worker() -> Self {
+        Self::with_sleeper(&Worker::current().sleeper)
+    }
+
+    #[inline]
+    fn with_sleeper(sleeper: &'a Sleeper) -> Self {
         Self { state: AtomicU8::new(LATCH_WAIT), sleeper }
     }
 
     #[inline]
-    fn wait(&self) -> bool {
+    pub fn wait(&self) -> bool {
         let prev = self.state.swap(LATCH_SLEEP, Ordering::AcqRel);
         debug_assert!([LATCH_WAIT, LATCH_READY, LATCH_PANIC].contains(&prev));
         if prev != LATCH_WAIT {
@@ -486,7 +464,7 @@ impl<'a> Latch<'a> {
     }
 
     #[inline]
-    fn set(&self, ok: bool) {
+    pub fn set(&self, ok: bool) {
         let s = if ok { LATCH_READY } else { LATCH_PANIC };
 
         let prev = self.state.swap(s, Ordering::AcqRel);
@@ -499,9 +477,17 @@ impl<'a> Latch<'a> {
 
 
 pub(crate) struct StackTask<'a, R, F: FnOnce() -> R + Send> {
-    f:      UnsafeCell<ManuallyDrop<F>>,
-    result: UnsafeCell<MaybeUninit<R>>,
-    latch:  Latch<'a>,
+    f: UnsafeCell<ManuallyDrop<F>>,
+    result: StackTaskResult<'a, R>,
+}
+
+struct StackTaskResult<'a, R> {
+    latch: Latch<'a>,
+    value: UnsafeCell<MaybeUninit<R>>,
+}
+
+pub(crate) struct StackTaskHandle<'me, 'a, R> {
+    result: &'me StackTaskResult<'a, R>,
 }
 
 impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
@@ -513,9 +499,11 @@ impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
     #[inline]
     fn with_sleeper(sleeper: &'a Sleeper, f: F) -> Self {
         Self {
-            f:      UnsafeCell::new(ManuallyDrop::new(f)),
-            result: UnsafeCell::new(MaybeUninit::uninit()),
-            latch:  Latch::new(sleeper),
+            f: UnsafeCell::new(ManuallyDrop::new(f)),
+            result: StackTaskResult {
+                latch:  Latch::with_sleeper(sleeper),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+            },
         }
     }
 
@@ -530,21 +518,23 @@ impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
                 // @panic
                 let result = f();
 
-                this.result.get().write(MaybeUninit::new(result));
-                this.latch.set(true);
+                this.result.value.get().write(MaybeUninit::new(result));
+                this.result.latch.set(true);
             },
         }
     }
 
-    #[must_use]
     #[inline]
-    pub fn complete(&self) -> bool {
-        self.latch.wait()
+    pub fn handle(&self) -> StackTaskHandle<'_, 'a, R> {
+        StackTaskHandle { result: &self.result }
     }
+}
 
+impl<'me, 'a, R> StackTaskHandle<'me, 'a, R> {
     #[inline]
-    pub unsafe fn into_result(self) -> R {
-        unsafe { self.result.into_inner().assume_init() }
+    pub unsafe fn join(&self) -> Option<R> {
+        let ok = self.result.latch.wait();
+        ok.then(|| unsafe { self.result.value.get().read().assume_init() })
     }
 }
 
