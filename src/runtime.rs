@@ -1,7 +1,7 @@
 use sti::boks::Box;
 use sti::vec::Vec;
 use std::sync::{Arc, Mutex, Condvar};
-use sti::mem::{Cell, MaybeUninit, ManuallyDrop};
+use sti::mem::{Cell, UnsafeCell, MaybeUninit, ManuallyDrop};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
 use core::ptr::NonNull;
 use core::marker::PhantomData;
@@ -137,39 +137,16 @@ impl Runtime {
         }
 
         SLEEPER.with(|sleeper| {
-            struct StackTask<'a, R, F> {
-                f: ManuallyDrop<F>,
-                result: MaybeUninit<R>,
-                sleeper: &'a Sleeper,
+            let task = StackTask::with_sleeper(sleeper, f);
+            Runtime::inject_task(unsafe { task.create_task() });
+
+            let ok = task.complete();
+            if ok {
+                unsafe { task.into_result() }
             }
-
-            let mut task = StackTask {
-                f: ManuallyDrop::new(f),
-                result: MaybeUninit::uninit(),
-                sleeper,
-            };
-
-            let ptr = NonNull::from(&mut task).cast();
-            let call = |ptr: NonNull<u8>| {
-                let ptr = ptr.cast::<StackTask<R, F>>().as_ptr();
-                let fbox = unsafe { &mut *ptr };
-
-                // @panic.
-                let f = unsafe { ManuallyDrop::take(&mut fbox.f) };
-
-                let result = f();
-                fbox.result = MaybeUninit::new(result);
-
-                fbox.sleeper.wake();
-            };
-
-            sleeper.prime();
-
-            Runtime::inject_task(unsafe { Task::new(ptr, call) });
-
-            sleeper.sleep();
-
-            return unsafe { task.result.assume_init() };
+            else {
+                todo!()
+            }
         })
     }
 
@@ -376,14 +353,14 @@ impl Worker {
 
 
 
-pub(crate) struct Sleeper {
+struct Sleeper {
     sleeping: Mutex<bool>,
     condvar: Condvar,
 }
 
 impl Sleeper {
     #[inline]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             sleeping: Mutex::new(false),
             condvar: Condvar::new(),
@@ -391,19 +368,20 @@ impl Sleeper {
     }
 
     #[inline]
-    pub fn prime(&self) {
+    fn prime(&self) {
         let mut sleeping = self.sleeping.lock().unwrap();
+        debug_assert!(*sleeping == false);
         *sleeping = true;
     }
 
     #[inline]
-    pub fn unprime(&self) {
+    fn unprime(&self) {
         let mut sleeping = self.sleeping.lock().unwrap();
         *sleeping = false;
     }
 
     #[inline]
-    pub fn sleep(&self) {
+    fn sleep(&self) {
         let mut sleeping = self.sleeping.lock().unwrap();
         if *sleeping {
             sleeping = self.condvar.wait(sleeping).unwrap();
@@ -412,7 +390,7 @@ impl Sleeper {
     }
 
     #[inline]
-    pub fn wake(&self) -> bool {
+    fn wake(&self) -> bool {
         let mut sleeping = self.sleeping.lock().unwrap();
         let was_sleeping = core::mem::replace(&mut *sleeping, false);
         drop(sleeping);
@@ -424,6 +402,151 @@ impl Sleeper {
     }
 }
 
+
+const LATCH_WAIT:  u8 = 0;
+const LATCH_SLEEP: u8 = 1;
+const LATCH_READY: u8 = 2;
+const LATCH_PANIC: u8 = 3;
+
+struct Latch<'a> {
+    state: AtomicU8,
+    sleeper: &'a Sleeper,
+}
+
+impl<'a> Latch<'a> {
+    #[inline]
+    fn new(sleeper: &'a Sleeper) -> Self {
+        Self { state: AtomicU8::new(LATCH_WAIT), sleeper }
+    }
+
+    #[inline]
+    fn wait(&self) -> bool {
+        let prev = self.state.swap(LATCH_SLEEP, Ordering::AcqRel);
+        debug_assert!([LATCH_WAIT, LATCH_READY, LATCH_PANIC].contains(&prev));
+        if prev != LATCH_WAIT {
+            return prev == LATCH_READY;
+        }
+
+        self.wait_slow_path()
+    }
+
+    #[cold]
+    fn wait_slow_path(&self) -> bool {
+        let rt = Runtime::get();
+        let worker = Worker::try_current();
+
+        loop {
+            if let Some(worker) = worker {
+                while let Some(task) = worker.find_task(rt) {
+                    task.call();
+
+                    // exit asap to reduce latency.
+                    if let Some(result) = check_completion(self) {
+                        return result;
+                    }
+                }
+            }
+
+
+            // cf: comment in `Worker::main`
+            // nb: we don't check for the termination signal because
+            //  that would result in a busy wait loop if there is no work
+            //  available. when eventually returning to the Worker main
+            //  loop, we'll check for termination before going to sleep
+            //  and exit instead.
+            self.sleeper.prime();
+
+            if let Some(result) = check_completion(self) {
+                self.sleeper.unprime();
+                return result;
+            }
+
+            if rt.tasks_pending() {
+                self.sleeper.unprime();
+                continue;
+            }
+
+
+            self.sleeper.sleep();
+
+            if let Some(result) = check_completion(self) {
+                return result;
+            }
+        }
+
+        #[inline]
+        fn check_completion(latch: &Latch) -> Option<bool> {
+            let state = latch.state.load(Ordering::Acquire);
+            debug_assert!([LATCH_SLEEP, LATCH_READY, LATCH_PANIC].contains(&state));
+            if state != LATCH_SLEEP {
+                return Some(state == LATCH_READY);
+            }
+            return None;
+        }
+    }
+
+    #[inline]
+    fn set(&self, ok: bool) {
+        let s = if ok { LATCH_READY } else { LATCH_PANIC };
+
+        let prev = self.state.swap(s, Ordering::AcqRel);
+        debug_assert!([LATCH_WAIT, LATCH_SLEEP].contains(&prev));
+        if prev == LATCH_SLEEP {
+            self.sleeper.wake();
+        }
+    }
+}
+
+
+pub(crate) struct StackTask<'a, R, F: FnOnce() -> R + Send> {
+    f:      UnsafeCell<ManuallyDrop<F>>,
+    result: UnsafeCell<MaybeUninit<R>>,
+    latch:  Latch<'a>,
+}
+
+impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
+    #[inline]
+    pub fn new_on_worker(f: F) -> Self {
+        Self::with_sleeper(&Worker::current().sleeper, f)
+    }
+
+    #[inline]
+    fn with_sleeper(sleeper: &'a Sleeper, f: F) -> Self {
+        Self {
+            f:      UnsafeCell::new(ManuallyDrop::new(f)),
+            result: UnsafeCell::new(MaybeUninit::uninit()),
+            latch:  Latch::new(sleeper),
+        }
+    }
+
+    #[inline]
+    pub unsafe fn create_task(&self) -> Task {
+        Task {
+            ptr: NonNull::from(self).cast(),
+            call: |ptr| unsafe {
+                let this = ptr.cast::<Self>().as_ref();
+                let f = ManuallyDrop::take(&mut *this.f.get());
+
+                // @panic
+                let result = f();
+
+                this.result.get().write(MaybeUninit::new(result));
+                this.latch.set(true);
+            },
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn complete(&self) -> bool {
+        self.latch.wait()
+    }
+
+    #[inline]
+    pub unsafe fn into_result(self) -> R {
+        unsafe { self.result.into_inner().assume_init() }
+    }
+}
 
 
 

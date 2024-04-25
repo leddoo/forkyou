@@ -12,7 +12,6 @@ where
     Runtime::on_worker(move || for_each_core(iter, f))
 }
 
-#[inline]
 fn for_each_core<T, I, F>(mut iter: I, f: &F)
 where
     T: Send,

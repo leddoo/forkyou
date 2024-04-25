@@ -1,12 +1,10 @@
 
 - todo:
-    - latch.
-        - atomic state + worker index.
-        - work until (latch).
     - wake more workers.
         - track sleeping workers.
         - per worker counter.
         - pop & steal return number of items left in queue.
+    - adaptive splitting.
     - move stuff into sti.
     - sti mem imports.
     - untracked tasks block terminator.

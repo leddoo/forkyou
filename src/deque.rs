@@ -237,7 +237,7 @@ mod tests {
 
                 count.fetch_add(v, Ordering::Relaxed);
 
-                for i in 0..5 {
+                for i in 0..20 {
                     core::hint::black_box(i);
                 }
             }
