@@ -61,10 +61,7 @@ impl<T: Send> Deque<T> {
         unsafe { buffer.at(end).write(MaybeUninit::new(value)) }
         drop(buffer);
 
-        // i have no idea what these are for.
-        // something something happens before.
-        // @todo: investigate and explain.
-        core::sync::atomic::fence(Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::Release);
 
         self.end.store(end.wrapping_add(1), Ordering::Release);
     }
@@ -75,14 +72,13 @@ impl<T: Send> Deque<T> {
 
         let begin = self.begin.load(Ordering::Acquire);
 
-        // i have no idea what these are for.
-        core::sync::atomic::fence(Ordering::SeqCst);
-
         let len = Self::queue_len(begin, end);
         if len <= 0 {
             self.end.store(begin, Ordering::Release);
             return None;
         }
+
+        core::sync::atomic::fence(Ordering::Acquire);
 
         let buffer = self.buffer.read();
         let result = unsafe { buffer.at(end.wrapping_sub(1)).read() };
@@ -109,13 +105,12 @@ impl<T: Send> Deque<T> {
         let begin = self.begin.load(Ordering::Acquire);
         let end   = self.end.load(Ordering::Acquire);
 
-        // i have no idea what these are for.
-        core::sync::atomic::fence(Ordering::SeqCst);
-
         let len = Self::queue_len(begin, end);
         if len <= 0 {
             return Err(true);
         }
+
+        core::sync::atomic::fence(Ordering::Acquire);
 
         let buffer = self.buffer.read();
         let result = unsafe { buffer.at(begin).read() };

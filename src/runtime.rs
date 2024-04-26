@@ -519,6 +519,7 @@ impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
                 let result = f();
 
                 this.result.value.get().write(MaybeUninit::new(result));
+                sti::sync::atomic::fence(Ordering::Release);
                 this.result.latch.set(true);
             },
         }
@@ -534,6 +535,7 @@ impl<'me, 'a, R> StackTaskHandle<'me, 'a, R> {
     #[inline]
     pub unsafe fn join(&self) -> Option<R> {
         let ok = self.result.latch.wait();
+        sti::sync::atomic::fence(Ordering::Acquire);
         ok.then(|| unsafe { self.result.value.get().read().assume_init() })
     }
 }

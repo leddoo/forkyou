@@ -38,7 +38,7 @@ pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -
 
             if scope.state.running.fetch_sub(1, Ordering::AcqRel) != 1 {
                 let ok = scope.state.latch.wait();
-                assert!(ok);
+                debug_assert!(ok);
             }
 
             if scope.state.panic.load(Ordering::Acquire) {
@@ -172,6 +172,54 @@ mod tests {
             return *x + y;
         });
         assert_eq!(result, 69);
+    }
+
+    #[test]
+    fn scoped_nop() {
+        let _t = crate::Terminator::new();
+
+        crate::scope(|_| {
+        });
+
+        crate::scope(|scope| {
+            scope.spawn(|| {});
+        });
+
+        crate::scope(|scope| {
+            scope.spawn(|| {
+                crate::scope(|_| {
+                });
+            });
+        });
+
+        crate::scope(|scope| {
+            scope.spawn(|| {
+                crate::scope(|scope| {
+                    scope.spawn(|| {});
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn scoped_read_bool() {
+        let _t = crate::Terminator::new();
+
+        crate::scope(|scope| {
+            let mut i = 0;
+            loop {
+                let a = scope.spawn(move || i < 100);
+                let b = scope.spawn(move || i <  99);
+                let c = scope.spawn(move || i <  98);
+                let d = scope.spawn(move || i <  97);
+                let e = scope.spawn(move || i <  96);
+
+                if a.join() & b.join() & c.join() & d.join() & e.join() {
+                    i += 5;
+                }
+                else { break }
+            }
+        });
     }
 }
 
