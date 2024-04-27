@@ -26,6 +26,7 @@ pub(crate) struct Runtime {
 
     termination_sleeper: Arc<Sleeper>,
     running_workers: AtomicU32,
+    sleeping_workers: AtomicU32,
 
     workers: Vec<Arc<Worker>>,
 
@@ -82,6 +83,7 @@ impl Runtime {
             terminating: AtomicBool::new(false),
             termination_sleeper: Arc::new(Sleeper::new()),
             running_workers: AtomicU32::new(num_workers),
+            sleeping_workers: AtomicU32::new(0),
             workers,
             injector_mutex: Mutex::new(()),
             injector_deque: Deque::new(),
@@ -108,9 +110,13 @@ impl Runtime {
         if had_more {
             let this = Runtime::get();
 
-            for worker in this.workers.iter() {
-                if worker.wake() {
-                    break;
+            // this can't deadlock cause we're on a worker.
+            // we'll get em next time.
+            if this.sleeping_workers.load(Ordering::Acquire) > 0 {
+                for worker in this.workers.iter() {
+                    if worker.wake() {
+                        break;
+                    }
                 }
             }
         }
@@ -126,6 +132,7 @@ impl Runtime {
             drop(guard);
         }
 
+        // always wake a worker, so we don't have to worry about deadlocks.
         for worker in this.workers.iter() {
             if worker.wake() {
                 break;
@@ -188,6 +195,23 @@ impl Runtime {
     #[inline]
     fn tasks_pending(&self) -> bool {
         self.injector_deque.len() > 0
+    }
+
+    #[inline]
+    fn worker_sleep(&self, sleeper: &Sleeper) {
+        debug_assert!(Worker::try_current().is_some());
+
+        // need to read running first, in case worker wakes up and exits
+        // before we inc sleeping. if we read sleeping first, we could see
+        // more sleeping than running workers.
+        let running = self.running_workers.load(Ordering::Acquire);
+        let prev_sleeping = self.sleeping_workers.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(prev_sleeping < running);
+
+        sleeper.sleep();
+
+        let prev_sleeping = self.sleeping_workers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev_sleeping > 0);
     }
 
     #[inline]
@@ -332,7 +356,7 @@ impl Worker {
                 continue;
             }
 
-            self.sleeper.sleep();
+            rt.worker_sleep(&self.sleeper);
         }
     }
 }
@@ -460,7 +484,12 @@ impl<'a> Latch<'a> {
             }
 
 
-            self.sleeper.sleep();
+            if worker.is_some() {
+                rt.worker_sleep(self.sleeper);
+            }
+            else {
+                self.sleeper.sleep();
+            }
 
             if let Some(result) = self.check_completion_awoken() {
                 return result;
