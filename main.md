@@ -2,7 +2,7 @@
 - todo:
     - wake more workers.
         - track sleeping workers.
-        - wake on submit if queue not empty & threads are sleeping.
+        - wake on submit if threads are sleeping.
     - adaptive splitting.
     - move stuff into sti.
     - sti mem imports.

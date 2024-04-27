@@ -89,7 +89,7 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
             let prev_running = state.running.fetch_sub(1, Ordering::AcqRel);
             debug_assert!(prev_running > 0);
             if prev_running == 1 {
-                state.latch.set(true);
+                unsafe { Latch::set(&state.latch, true) };
             }
 
             return result;

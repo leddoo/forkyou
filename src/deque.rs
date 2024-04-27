@@ -5,6 +5,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 
+
 // impl of "Dynamic Circular Work-Stealing Deque" by Chase and Lev, SPAA 2005
 pub struct Deque<T: Send> {
     begin: AtomicUsize,
@@ -21,6 +22,12 @@ impl<T: Send> Deque<T> {
         }
     }
 
+    #[inline(always)]
+    fn queue_len(begin: usize, end: usize) -> isize {
+        (end as isize).wrapping_sub(begin as isize)
+    }
+
+
     #[inline]
     pub fn len(&self) -> usize {
         let begin = self.begin.load(Ordering::Acquire);
@@ -28,13 +35,7 @@ impl<T: Send> Deque<T> {
         Self::queue_len(begin, end).max(0) as usize
     }
 
-
-    #[inline(always)]
-    fn queue_len(begin: usize, end: usize) -> isize {
-        (end as isize).wrapping_sub(begin as isize)
-    }
-
-    pub unsafe fn push(&self, value: T) {
+    pub unsafe fn push(&self, value: T) -> bool {
         let begin = self.begin.load(Ordering::Acquire);
         let end   = self.end.load(Ordering::Acquire);
 
@@ -61,15 +62,13 @@ impl<T: Send> Deque<T> {
         unsafe { buffer.at(end).write(MaybeUninit::new(value)) }
         drop(buffer);
 
-        core::sync::atomic::fence(Ordering::Release);
-
         self.end.store(end.wrapping_add(1), Ordering::Release);
+
+        return len > 0;
     }
 
     pub unsafe fn pop(&self) -> Option<T> {
-        let end = self.end.load(Ordering::Acquire);
-        self.end.store(end.wrapping_sub(1), Ordering::Release);
-
+        let end = self.end.fetch_sub(1, Ordering::AcqRel);
         let begin = self.begin.load(Ordering::Acquire);
 
         let len = Self::queue_len(begin, end);
@@ -77,8 +76,6 @@ impl<T: Send> Deque<T> {
             self.end.store(begin, Ordering::Release);
             return None;
         }
-
-        core::sync::atomic::fence(Ordering::Acquire);
 
         let buffer = self.buffer.read();
         let result = unsafe { buffer.at(end.wrapping_sub(1)).read() };
@@ -103,14 +100,12 @@ impl<T: Send> Deque<T> {
 
     pub fn steal(&self) -> Result<T, bool> {
         let begin = self.begin.load(Ordering::Acquire);
-        let end   = self.end.load(Ordering::Acquire);
+        let end = self.end.load(Ordering::Acquire);
 
         let len = Self::queue_len(begin, end);
         if len <= 0 {
             return Err(true);
         }
-
-        core::sync::atomic::fence(Ordering::Acquire);
 
         let buffer = self.buffer.read();
         let result = unsafe { buffer.at(begin).read() };
@@ -118,7 +113,7 @@ impl<T: Send> Deque<T> {
 
         if let Err(_) = self.begin.compare_exchange(
             begin, begin.wrapping_add(1),
-            Ordering::SeqCst, Ordering::Acquire)
+            Ordering::SeqCst, Ordering::Relaxed)
         {
             return Err(false);
         }
@@ -204,10 +199,10 @@ mod tests {
         }
 
         for i in 0..100 {
-            unsafe { state.1.push(i) }
+            unsafe { state.1.push(i) };
         }
         for _ in 0..NUM_THREADS {
-            unsafe { state.1.push(u32::MAX) }
+            unsafe { state.1.push(u32::MAX) };
         }
 
         for handle in handles {
@@ -232,7 +227,8 @@ mod tests {
 
                 count.fetch_add(v, Ordering::Relaxed);
 
-                for i in 0..20 {
+                let n = if cfg!(miri) { 5 } else { 100 };
+                for i in 0..n {
                     core::hint::black_box(i);
                 }
             }
@@ -242,7 +238,7 @@ mod tests {
             stealer(&state.0, &state.1)));
 
         for i in 0..1000 {
-            unsafe { state.1.push(i) }
+            unsafe { state.1.push(i) };
         }
 
         let mut delta = 0;
@@ -252,7 +248,7 @@ mod tests {
         }
         state.0.fetch_add(delta, Ordering::Relaxed);
 
-        unsafe { state.1.push(u32::MAX) }
+        unsafe { state.1.push(u32::MAX) };
 
         handle.join().unwrap();
 
@@ -322,10 +318,10 @@ mod tests {
 
         handle.join().unwrap();
 
-        // for release build.
-        let mut expected = 0;
+        // the formula doesn't seem to be correct when wrapping.
+        let mut expected = 0u32;
         for i in 0..v {
-            expected += i;
+            expected = expected.wrapping_add(i);
         }
 
         let result = state.1.load(Ordering::Relaxed);

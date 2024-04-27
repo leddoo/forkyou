@@ -49,6 +49,7 @@ impl Runtime {
         // syncs with terminator drop.
         // again, this is mostly to please miri.
         // in a real program, this is only executed once.
+        // @todo investigate whether this actually does anything.
         core::sync::atomic::fence(Ordering::SeqCst);
 
         if STATE.compare_exchange(
@@ -90,17 +91,29 @@ impl Runtime {
 
     pub fn submit_task(task: Task) {
         if let Some(worker) = Worker::try_current() {
-            worker.push_task(task);
+            Self::submit_task_on_worker_core(worker, task);
         }
         else {
             Self::inject_task(task);
         }
     }
 
-    #[inline]
     pub fn submit_task_on_worker(task: Task) {
-        let worker = Worker::current();
-        worker.push_task(task);
+        Self::submit_task_on_worker_core(Worker::current(), task);
+    }
+
+    fn submit_task_on_worker_core(worker: &Worker, task: Task) {
+        let had_more = worker.push_task(task);
+
+        if had_more {
+            let this = Runtime::get();
+
+            for worker in this.workers.iter() {
+                if worker.wake() {
+                    break;
+                }
+            }
+        }
     }
 
     #[cold]
@@ -275,7 +288,7 @@ impl Worker {
     }
 
     #[inline]
-    fn push_task(&self, task: Task) {
+    fn push_task(&self, task: Task) -> bool {
         debug_assert!(core::ptr::eq(self, Worker::current()));
         unsafe { self.deque.push(task) }
     }
@@ -364,12 +377,16 @@ impl Sleeper {
 
     #[inline]
     fn wake(&self) -> bool {
-        let mut sleeping = self.sleeping.lock().unwrap();
-        let was_sleeping = core::mem::replace(&mut *sleeping, false);
-        drop(sleeping);
+        unsafe { Self::wake_unprotected(self) }
+    }
 
+    #[inline]
+    unsafe fn wake_unprotected(this: *const Self) -> bool {
+        let this = unsafe { &*this };
+        let mut sleeping = this.sleeping.lock().unwrap();
+        let was_sleeping = core::mem::replace(&mut *sleeping, false);
         if was_sleeping {
-            self.condvar.notify_one();
+            this.condvar.notify_one();
         }
         return was_sleeping;
     }
@@ -399,10 +416,8 @@ impl<'a> Latch<'a> {
 
     #[inline]
     pub fn wait(&self) -> bool {
-        let prev = self.state.swap(LATCH_SLEEP, Ordering::AcqRel);
-        debug_assert!([LATCH_WAIT, LATCH_READY, LATCH_PANIC].contains(&prev));
-        if prev != LATCH_WAIT {
-            return prev == LATCH_READY;
+        if let Some(result) = self.check_completion_awake() {
+            return result;
         }
 
         self.wait_slow_path()
@@ -419,7 +434,7 @@ impl<'a> Latch<'a> {
                     task.call();
 
                     // exit asap to reduce latency.
-                    if let Some(result) = check_completion(self) {
+                    if let Some(result) = self.check_completion_awake() {
                         return result;
                     }
                 }
@@ -434,43 +449,74 @@ impl<'a> Latch<'a> {
             //  and exit instead.
             self.sleeper.prime();
 
-            if let Some(result) = check_completion(self) {
-                self.sleeper.unprime();
-                return result;
-            }
-
             if rt.tasks_pending() {
                 self.sleeper.unprime();
                 continue;
             }
 
+            if let Some(result) = self.check_completion_for_sleep() {
+                self.sleeper.unprime();
+                return result;
+            }
+
 
             self.sleeper.sleep();
 
-            if let Some(result) = check_completion(self) {
+            if let Some(result) = self.check_completion_awoken() {
                 return result;
             }
-        }
-
-        #[inline]
-        fn check_completion(latch: &Latch) -> Option<bool> {
-            let state = latch.state.load(Ordering::Acquire);
-            debug_assert!([LATCH_SLEEP, LATCH_READY, LATCH_PANIC].contains(&state));
-            if state != LATCH_SLEEP {
-                return Some(state == LATCH_READY);
-            }
-            return None;
         }
     }
 
     #[inline]
-    pub fn set(&self, ok: bool) {
+    fn check_completion_awake(&self) -> Option<bool> {
+        let state = self.state.load(Ordering::Acquire);
+        debug_assert!([LATCH_WAIT, LATCH_READY, LATCH_PANIC].contains(&state));
+        if state != LATCH_WAIT {
+            return Some(state == LATCH_READY);
+        }
+        return None;
+    }
+
+    #[inline]
+    fn check_completion_awoken(&self) -> Option<bool> {
+        let state = self.state.swap(LATCH_WAIT, Ordering::AcqRel);
+        debug_assert!([LATCH_SLEEP, LATCH_READY, LATCH_PANIC].contains(&state));
+        if state != LATCH_SLEEP {
+            return Some(state == LATCH_READY);
+        }
+        return None;
+    }
+
+    #[inline]
+    fn check_completion_for_sleep(&self) -> Option<bool> {
+        let state = self.state.swap(LATCH_SLEEP, Ordering::AcqRel);
+        debug_assert!([LATCH_WAIT, LATCH_READY, LATCH_PANIC].contains(&state));
+        if state != LATCH_WAIT {
+            return Some(state == LATCH_READY);
+        }
+        return None;
+    }
+
+
+    #[inline]
+    pub unsafe fn set(this: *const Self, ok: bool) {
         let s = if ok { LATCH_READY } else { LATCH_PANIC };
 
-        let prev = self.state.swap(s, Ordering::AcqRel);
+        let this = unsafe { &*this };
+        let sleeper = this.sleeper;
+
+        let prev = this.state.swap(s, Ordering::AcqRel);
         debug_assert!([LATCH_WAIT, LATCH_SLEEP].contains(&prev));
+
+        // `this` may now be dangling (if the thread wasn't sleeping or was just
+        // woken up by someone else and has already deallocated a stack task
+        // containing this latch),
+        // don't access it!
+
         if prev == LATCH_SLEEP {
-            self.sleeper.wake();
+            // note: the sleeper must still be valid.
+            unsafe { Sleeper::wake_unprotected(sleeper) };
         }
     }
 }
@@ -501,7 +547,7 @@ impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
         Self {
             f: UnsafeCell::new(ManuallyDrop::new(f)),
             result: StackTaskResult {
-                latch:  Latch::with_sleeper(sleeper),
+                latch: Latch::with_sleeper(sleeper),
                 value: UnsafeCell::new(MaybeUninit::uninit()),
             },
         }
@@ -513,14 +559,23 @@ impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
             ptr: NonNull::from(self).cast(),
             call: |ptr| unsafe {
                 let this = ptr.cast::<Self>().as_ref();
+
+                // note: this load synchronizes with the store in `Latch::set`
+                // at the end of the function. well kinda.
+                // this happens when a stack task is created at the same address
+                // quickly after another a stack task there completed there.
+                // this makes miri shut up about data races on the retag of `f`
+                // below. not sure this is actually necessary.
+                let s = this.result.latch.state.load(Ordering::Acquire);
+                debug_assert!([LATCH_WAIT, LATCH_SLEEP].contains(&s));
+
                 let f = ManuallyDrop::take(&mut *this.f.get());
 
                 // @panic
                 let result = f();
 
                 this.result.value.get().write(MaybeUninit::new(result));
-                sti::sync::atomic::fence(Ordering::Release);
-                this.result.latch.set(true);
+                Latch::set(&this.result.latch, true);
             },
         }
     }
@@ -535,7 +590,6 @@ impl<'me, 'a, R> StackTaskHandle<'me, 'a, R> {
     #[inline]
     pub unsafe fn join(&self) -> Option<R> {
         let ok = self.result.latch.wait();
-        sti::sync::atomic::fence(Ordering::Acquire);
         ok.then(|| unsafe { self.result.value.get().read().assume_init() })
     }
 }
