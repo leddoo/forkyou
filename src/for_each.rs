@@ -1,4 +1,5 @@
 use crate::{Runtime, Worker, Spliterator, join_on_worker};
+use crate::join::Splitter;
 
 
 #[inline]
@@ -9,24 +10,34 @@ where
     F: Fn(T) + Send + Sync
 {
     let f = &f;
-    Runtime::on_worker(move |worker, _| for_each_core(worker, iter, f))
+    Runtime::on_worker(move |worker, _| {
+        let splitter = Splitter::new(worker.num_workers());
+        return for_each_core(worker, false, splitter, iter, f);
+    })
 }
 
-fn for_each_core<T, I, F>(worker: &Worker, mut iter: I, f: &F)
+fn for_each_core<T, I, F>(
+    worker: &Worker,
+    stolen: bool,
+    mut splitter: Splitter,
+    mut iter: I,
+    f: &F)
 where
     T: Send,
     I: Spliterator<Item = T> + Send,
     F: Fn(T) + Send + Sync
 {
-    if iter.len() >= 2 {
+    if splitter.try_split(iter.len(), stolen.then(|| worker.num_workers())) {
         let mid = iter.len() / 2;
         let (lhs, rhs) = iter.split(mid);
         join_on_worker(worker,
-            move |worker, _| for_each_core(worker, lhs, f),
-            move |worker, _| for_each_core(worker, rhs, f));
+            move |worker, stolen| for_each_core(worker, stolen, splitter, lhs, f),
+            move |worker, stolen| for_each_core(worker, stolen, splitter, rhs, f));
     }
-    else if iter.len() == 1 {
-        f(iter.next());
+    else {
+        for _ in 0..iter.len() {
+            f(iter.next());
+        }
     }
 }
 

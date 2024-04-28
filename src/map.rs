@@ -3,6 +3,7 @@ use sti::vec::Vec;
 use core::mem::MaybeUninit;
 
 use crate::{Runtime, Worker, Spliterator, join_on_worker};
+use crate::join::Splitter;
 
 
 #[inline]
@@ -60,11 +61,19 @@ where
     F: Fn(T) -> U + Send + Sync
 {
     let f = &f;
-    Runtime::on_worker(move |worker, _|
-        map_core_core(worker, iter, result, f))
+    Runtime::on_worker(move |worker, _| {
+        let splitter = Splitter::new(worker.num_workers());
+        return map_core_core(worker, false, splitter, iter, result, f);
+    })
 }
 
-fn map_core_core<T, U, I, F>(worker: &Worker, mut iter: I, result: &mut [MaybeUninit<U>], f: &F)
+fn map_core_core<T, U, I, F>(
+    worker: &Worker,
+    stolen: bool,
+    mut splitter: Splitter,
+    mut iter: I,
+    result: &mut [MaybeUninit<U>],
+    f: &F)
 where
     T: Send,
     U: Send,
@@ -73,16 +82,18 @@ where
 {
     assert_eq!(iter.len(), result.len());
 
-    if iter.len() >= 2 {
+    if splitter.try_split(iter.len(), stolen.then(|| worker.num_workers())) {
         let mid = iter.len() / 2;
         let (lhs, rhs) = iter.split(mid);
         let (lhs_result, rhs_result) = result.split_at_mut(mid);
         join_on_worker(worker,
-            move |worker, _| map_core_core(worker, lhs, lhs_result, f),
-            move |worker, _| map_core_core(worker, rhs, rhs_result, f));
+            move |worker, stolen| map_core_core(worker, stolen, splitter, lhs, lhs_result, f),
+            move |worker, stolen| map_core_core(worker, stolen, splitter, rhs, rhs_result, f));
     }
-    else if iter.len() == 1 {
-        result[0] = MaybeUninit::new(f(iter.next()));
+    else {
+        for i in 0..iter.len() {
+            result[i] = MaybeUninit::new(f(iter.next()));
+        }
     }
 }
 

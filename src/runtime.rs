@@ -258,6 +258,11 @@ impl Worker {
         unsafe { self.runtime.as_ref() }
     }
 
+    #[inline]
+    pub fn num_workers(&self) -> usize {
+        self.runtime().workers.len()
+    }
+
     pub fn submit_task(&self, task: Task) {
         let had_more = self.push_task(task);
         if had_more {
@@ -628,10 +633,10 @@ impl<'a, R, F: FnOnce(&Worker, bool) -> R + Send> StackTask<'a, R, F> {
                 let f = ManuallyDrop::take(&mut *this.f.get());
 
                 let worker = Worker::current();
-                let migrated = !core::ptr::eq(this.result.latch.sleeper, &worker.sleeper);
+                let stolen = !core::ptr::eq(this.result.latch.sleeper, &worker.sleeper);
 
                 // @panic
-                let result = f(worker, migrated);
+                let result = f(worker, stolen);
 
                 this.result.value.get().write(MaybeUninit::new(result));
                 Latch::set(&this.result.latch, true);

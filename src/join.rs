@@ -29,6 +29,38 @@ where F1: FnOnce(&Worker, bool) -> R1 + Send,
 }
 
 
+#[derive(Clone, Copy)]
+pub(crate) struct Splitter {
+    num_tasks: usize,
+}
+
+impl Splitter {
+    #[inline]
+    pub fn new(num_tasks: usize) -> Self {
+        Self { num_tasks }
+    }
+
+    #[inline]
+    pub fn try_split(&mut self, len: usize, stolen: Option<usize>) -> bool {
+        if len < 2 {
+            return false;
+        }
+
+        if let Some(num_tasks) = stolen {
+            self.num_tasks = num_tasks;
+            return true;
+        }
+
+        if self.num_tasks >= 2 {
+            self.num_tasks /= 2;
+            return true;
+        }
+
+        return false;
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use crate::join;

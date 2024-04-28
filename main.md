@@ -1,6 +1,5 @@
 
 - todo:
-    - adaptive splitting.
     - move stuff into sti.
     - sti mem imports.
     - panic handling.
