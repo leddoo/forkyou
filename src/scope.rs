@@ -2,7 +2,7 @@ use sti::arena::Arena;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::{CovariantLifetime, InvariantLifetime};
 
-use crate::Runtime;
+use crate::{Runtime, Worker};
 use crate::runtime::{Latch, StackTask, StackTaskHandle};
 
 
@@ -19,16 +19,17 @@ pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -
         };
     };
 
-    Runtime::on_worker(|| {
+    Runtime::on_worker(|worker, _| {
         SCOPE_ARENA.with(|alloc| {
             let save = alloc.save();
 
             let scope = Scope {
+                worker,
                 alloc,
                 state: ScopeState {
                     panic: AtomicBool::new(false),
                     running: AtomicUsize::new(1),
-                    latch: Latch::new_on_worker(),
+                    latch: Latch::new_on_worker(worker),
                 },
                 _s: Default::default(),
                 _p: Default::default(),
@@ -60,6 +61,7 @@ pub fn scope<'p, R: Send, F: for<'s> FnOnce(&Scope<'s, 'p>) -> R + Send>(f: F) -
 
 
 pub struct Scope<'s, 'p: 's> {
+    worker: &'s Worker,
     alloc: &'s Arena,
     state: ScopeState<'s>,
     _s: InvariantLifetime<'s>,
@@ -82,7 +84,7 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
     pub fn spawn<R, F: FnOnce() -> R + Send + 'p>(&self, f: F) -> ScopeTask<'s, R> {
         let state = unsafe { sti::erase!(&ScopeState, &self.state) };
 
-        let task = self.alloc.alloc_new(StackTask::new_on_worker(move || {
+        let task = self.alloc.alloc_new(StackTask::new_on_worker(self.worker, move |_, _| {
             // @panic
             let result = f();
 
@@ -98,7 +100,7 @@ impl<'s, 'p: 's> Scope<'s, 'p> {
         let prev_running = self.state.running.fetch_add(1, Ordering::AcqRel);
         assert!(prev_running < usize::MAX);
 
-        Runtime::submit_task_on_worker(unsafe { task.create_task() });
+        self.worker.submit_task(unsafe { task.create_task() });
 
         return ScopeTask { handle: task.handle() };
     }

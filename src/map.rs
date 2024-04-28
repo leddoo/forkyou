@@ -2,7 +2,7 @@ use sti::alloc::{Alloc, GlobalAlloc};
 use sti::vec::Vec;
 use core::mem::MaybeUninit;
 
-use crate::{Runtime, Spliterator, join_on_worker};
+use crate::{Runtime, Worker, Spliterator, join_on_worker};
 
 
 #[inline]
@@ -60,10 +60,11 @@ where
     F: Fn(T) -> U + Send + Sync
 {
     let f = &f;
-    Runtime::on_worker(move || map_core_core(iter, result, f))
+    Runtime::on_worker(move |worker, _|
+        map_core_core(worker, iter, result, f))
 }
 
-fn map_core_core<T, U, I, F>(mut iter: I, result: &mut [MaybeUninit<U>], f: &F)
+fn map_core_core<T, U, I, F>(worker: &Worker, mut iter: I, result: &mut [MaybeUninit<U>], f: &F)
 where
     T: Send,
     U: Send,
@@ -76,9 +77,9 @@ where
         let mid = iter.len() / 2;
         let (lhs, rhs) = iter.split(mid);
         let (lhs_result, rhs_result) = result.split_at_mut(mid);
-        join_on_worker(
-            move || map_core_core(lhs, lhs_result, f),
-            move || map_core_core(rhs, rhs_result, f));
+        join_on_worker(worker,
+            move |worker, _| map_core_core(worker, lhs, lhs_result, f),
+            move |worker, _| map_core_core(worker, rhs, rhs_result, f));
     }
     else if iter.len() == 1 {
         result[0] = MaybeUninit::new(f(iter.next()));

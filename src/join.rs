@@ -1,5 +1,5 @@
 use crate::Runtime;
-use crate::runtime::StackTask;
+use crate::runtime::{Worker, StackTask};
 
 
 #[inline]
@@ -7,18 +7,21 @@ pub fn join<R1, F1, R2, F2>(f1: F1, f2: F2) -> (R1, R2)
 where R1: Send, F1: FnOnce() -> R1 + Send,
       R2: Send, F2: FnOnce() -> R2 + Send
 {
-    Runtime::on_worker(move || join_on_worker(f1, f2))
+    Runtime::on_worker(move |worker, _|
+        join_on_worker(worker,
+            move |_, _| f1(),
+            move |_, _| f2()))
 }
 
-pub fn join_on_worker<R1, F1, R2, F2>(f1: F1, f2: F2) -> (R1, R2)
-where F1: FnOnce() -> R1 + Send,
-      F2: FnOnce() -> R2 + Send
+pub(crate) fn join_on_worker<R1, F1, R2, F2>(worker: &Worker, f1: F1, f2: F2) -> (R1, R2)
+where F1: FnOnce(&Worker, bool) -> R1 + Send,
+      F2: FnOnce(&Worker, bool) -> R2 + Send
 {
-    let f2 = StackTask::new_on_worker(f2);
-    Runtime::submit_task_on_worker(unsafe { f2.create_task() });
+    let f2 = StackTask::new_on_worker(worker, f2);
+    worker.submit_task(unsafe { f2.create_task() });
 
     // @panic.
-    let r1 = f1();
+    let r1 = f1(worker, false);
 
     let r2 = unsafe { f2.handle().join().expect("todo") };
 

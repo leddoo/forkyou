@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
 use core::ptr::NonNull;
 use core::marker::PhantomData;
 
-use crate::{Task, XorShift32};
+use crate::{Task, XorShift32, AssertSend};
 use crate::deque::Deque;
 
 
@@ -36,13 +36,22 @@ pub(crate) struct Runtime {
 
 impl Runtime {
     #[inline]
-    fn get() -> &'static Runtime {
+    fn get_or_init() -> &'static Runtime {
         let p = RUNTIME.load(Ordering::Acquire);
         if !p.is_null() {
             return unsafe { &*p };
         }
 
         return Runtime::get_slow_path();
+    }
+
+    #[inline]
+    fn expect() -> &'static Runtime {
+        let p = RUNTIME.load(Ordering::Acquire);
+        if p.is_null() {
+            panic!("runtime not init");
+        }
+        return unsafe { &*p };
     }
 
     #[cold]
@@ -57,7 +66,7 @@ impl Runtime {
             UNINIT, INITING,
             Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
-            let ptr = Box::new(Runtime::init()).into_raw_parts();
+            let ptr = Runtime::init();
             RUNTIME.store(ptr.as_ptr(), Ordering::Release);
             STATE.store(INIT, Ordering::Release);
         }
@@ -72,13 +81,15 @@ impl Runtime {
     }
 
     #[cold]
-    fn init() -> Self {
+    fn init() -> NonNull<Runtime> {
+        let ptr: NonNull<Runtime> = sti::alloc::alloc_ptr(&sti::alloc::GlobalAlloc).expect("oom");
+
         let num_workers = crate::ncpu() as u32;
 
         let workers = Vec::from_iter(
-            (0..num_workers).map(|_| { Worker::spawn() }));
+            (0..num_workers).map(|_| { Worker::spawn(ptr) }));
 
-        Self {
+        let this = Self {
             has_terminator: AtomicBool::new(false),
             terminating: AtomicBool::new(false),
             termination_sleeper: Arc::new(Sleeper::new()),
@@ -87,44 +98,25 @@ impl Runtime {
             workers,
             injector_mutex: Mutex::new(()),
             injector_deque: Deque::new(),
-        }
+        };
+        unsafe { ptr.as_ptr().write(this) };
+
+        return ptr;
     }
 
 
     pub fn submit_task(task: Task) {
         if let Some(worker) = Worker::try_current() {
-            Self::submit_task_on_worker_core(worker, task);
+            worker.submit_task(task);
         }
         else {
             Self::inject_task(task);
         }
     }
 
-    pub fn submit_task_on_worker(task: Task) {
-        Self::submit_task_on_worker_core(Worker::current(), task);
-    }
-
-    fn submit_task_on_worker_core(worker: &Worker, task: Task) {
-        let had_more = worker.push_task(task);
-
-        if had_more {
-            let this = Runtime::get();
-
-            // this can't deadlock cause we're on a worker.
-            // we'll get em next time.
-            if this.sleeping_workers.load(Ordering::Acquire) > 0 {
-                for worker in this.workers.iter() {
-                    if worker.wake() {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     #[cold]
-    pub fn inject_task(task: Task) {
-        let this = Runtime::get();
+    fn inject_task(task: Task) {
+        let this = Runtime::get_or_init();
 
         unsafe {
             let guard = this.injector_mutex.lock();
@@ -133,17 +125,22 @@ impl Runtime {
         }
 
         // always wake a worker, so we don't have to worry about deadlocks.
-        for worker in this.workers.iter() {
+        this.wake_one_worker();
+    }
+
+    fn wake_one_worker(&self) {
+        for worker in self.workers.iter() {
             if worker.wake() {
                 break;
             }
         }
     }
 
+
     #[inline]
-    pub fn on_worker<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
-        if Worker::try_current().is_some() {
-            f()
+    pub fn on_worker<R: Send, F: FnOnce(&Worker, bool) -> R + Send>(f: F) -> R {
+        if let Some(worker) = Worker::try_current() {
+            f(worker, false)
         }
         else {
             Runtime::on_worker_slow_path(f)
@@ -151,7 +148,7 @@ impl Runtime {
     }
 
     #[cold]
-    fn on_worker_slow_path<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
+    fn on_worker_slow_path<R: Send, F: FnOnce(&Worker, bool) -> R + Send>(f: F) -> R {
         thread_local! {
             static SLEEPER: Sleeper = Sleeper::new();
         }
@@ -215,10 +212,11 @@ impl Runtime {
     }
 
     #[inline]
-    fn worker_exit() {
-        let rt = Runtime::get();
+    fn worker_exit(this: *const Runtime) {
+        debug_assert!(core::ptr::eq(this, Runtime::expect()));
+        let this = unsafe { &*this };
 
-        let n = rt.running_workers.fetch_sub(1, Ordering::SeqCst);
+        let n = this.running_workers.fetch_sub(1, Ordering::SeqCst);
         assert!(n != 0);
 
         // not sure this is necessary.
@@ -233,7 +231,7 @@ impl Runtime {
             // `rt` is dropped by the `wake` call,
             // so we can't keep any refs into it (`termination_sleeper`),
             // even if we don't use them anymore (strong protectors).
-            let sleeper = rt.termination_sleeper.clone();
+            let sleeper = this.termination_sleeper.clone();
             sleeper.wake();
         }
     }
@@ -245,7 +243,8 @@ thread_local! {
     static WORKER: Cell<*const Worker> = Cell::new(core::ptr::null());
 }
 
-struct Worker {
+pub(crate) struct Worker {
+    runtime: NonNull<Runtime>,
     sleeper: Sleeper,
     deque: Deque<Task>,
     steal_rng: Cell<XorShift32>,
@@ -254,8 +253,28 @@ struct Worker {
 unsafe impl Sync for Worker {}
 
 impl Worker {
-    fn spawn() -> Arc<Worker> {
+    #[inline]
+    pub fn runtime(&self) -> &Runtime {
+        unsafe { self.runtime.as_ref() }
+    }
+
+    pub fn submit_task(&self, task: Task) {
+        let had_more = self.push_task(task);
+        if had_more {
+            let rt = self.runtime();
+
+            // this can't deadlock cause we're on a worker.
+            // we'll get em next time.
+            if rt.sleeping_workers.load(Ordering::Acquire) > 0 {
+                rt.wake_one_worker();
+            }
+        }
+    }
+
+
+    fn spawn(runtime: NonNull<Runtime>) -> Arc<Worker> {
         let worker = Arc::new(Worker {
+            runtime,
             sleeper: Sleeper::new(),
             deque: Deque::new(),
             steal_rng: Cell::new(XorShift32::new()),
@@ -264,7 +283,15 @@ impl Worker {
         worker.steal_rng.set(XorShift32::from_seed(
             sti::hash::fxhash::fxhash32(&(worker.as_ref() as *const _))));
 
-        std::thread::spawn(sti::enclose!(worker; move || {
+        let send_worker = unsafe { AssertSend::new(worker.clone()) };
+        std::thread::spawn(move || {
+            let worker = send_worker.into_inner();
+
+            // block until runtime is init.
+            // this is critical!!
+            let rt = Runtime::get_or_init();
+            assert!(core::ptr::eq(worker.runtime.as_ptr(), rt));
+
             WORKER.with(|ptr| {
                 ptr.set(&*worker);
             });
@@ -276,8 +303,8 @@ impl Worker {
                 ptr.set(core::ptr::null());
             });
 
-            Runtime::worker_exit();
-        }));
+            Runtime::worker_exit(worker.runtime());
+        });
 
         return worker;
     }
@@ -299,12 +326,12 @@ impl Worker {
     }
 
     #[inline]
-    fn find_task(&self, rt: &Runtime) -> Option<Task> {
+    fn find_task(&self) -> Option<Task> {
         let task = unsafe { self.deque.pop() };
         if task.is_some() { return task }
 
         let mut rng = self.steal_rng.get();
-        let task = rt.steal_task(&mut rng, self);
+        let task = self.runtime().steal_task(&mut rng, self);
         self.steal_rng.set(rng);
         if task.is_some() { return task }
 
@@ -329,9 +356,9 @@ impl Worker {
     }
 
     fn main(&self) {
-        let rt = Runtime::get();
+        let rt = self.runtime();
         loop {
-            while let Some(task) = self.find_task(rt) {
+            while let Some(task) = self.find_task() {
                 task.call();
             }
 
@@ -429,8 +456,8 @@ pub(crate) struct Latch<'a> {
 
 impl<'a> Latch<'a> {
     #[inline]
-    pub fn new_on_worker() -> Self {
-        Self::with_sleeper(&Worker::current().sleeper)
+    pub fn new_on_worker(worker: &'a Worker) -> Self {
+        Self::with_sleeper(&worker.sleeper)
     }
 
     #[inline]
@@ -449,12 +476,12 @@ impl<'a> Latch<'a> {
 
     #[cold]
     fn wait_slow_path(&self) -> bool {
-        let rt = Runtime::get();
+        let rt = Runtime::expect();
         let worker = Worker::try_current();
 
         loop {
             if let Some(worker) = worker {
-                while let Some(task) = worker.find_task(rt) {
+                while let Some(task) = worker.find_task() {
                     task.call();
 
                     // exit asap to reduce latency.
@@ -551,7 +578,7 @@ impl<'a> Latch<'a> {
 }
 
 
-pub(crate) struct StackTask<'a, R, F: FnOnce() -> R + Send> {
+pub(crate) struct StackTask<'a, R, F: FnOnce(&Worker, bool) -> R + Send> {
     f: UnsafeCell<ManuallyDrop<F>>,
     result: StackTaskResult<'a, R>,
 }
@@ -565,10 +592,10 @@ pub(crate) struct StackTaskHandle<'me, 'a, R> {
     result: &'me StackTaskResult<'a, R>,
 }
 
-impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
+impl<'a, R, F: FnOnce(&Worker, bool) -> R + Send> StackTask<'a, R, F> {
     #[inline]
-    pub fn new_on_worker(f: F) -> Self {
-        Self::with_sleeper(&Worker::current().sleeper, f)
+    pub fn new_on_worker(worker: &'a Worker, f: F) -> Self {
+        Self::with_sleeper(&worker.sleeper, f)
     }
 
     #[inline]
@@ -600,8 +627,11 @@ impl<'a, R, F: FnOnce() -> R + Send> StackTask<'a, R, F> {
 
                 let f = ManuallyDrop::take(&mut *this.f.get());
 
+                let worker = Worker::current();
+                let migrated = !core::ptr::eq(this.result.latch.sleeper, &worker.sleeper);
+
                 // @panic
-                let result = f();
+                let result = f(worker, migrated);
 
                 this.result.value.get().write(MaybeUninit::new(result));
                 Latch::set(&this.result.latch, true);
@@ -635,7 +665,7 @@ impl Terminator {
             panic!("terminator on worker");
         }
 
-        let rt = Runtime::get();
+        let rt = Runtime::get_or_init();
         if rt.has_terminator.swap(true, Ordering::SeqCst) {
             panic!("multiple terminators");
         }
@@ -646,7 +676,7 @@ impl Terminator {
 
 impl Drop for Terminator {
     fn drop(&mut self) {
-        let rt = Runtime::get();
+        let rt = Runtime::expect();
         debug_assert!(rt.has_terminator.load(Ordering::SeqCst));
 
         rt.termination_sleeper.prime();

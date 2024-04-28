@@ -23,9 +23,12 @@ mod for_each;
 pub use runtime::Terminator;
 pub use untracked::spawn_untracked;
 pub use scope::scope;
-pub use join::{join, join_on_worker};
+pub use join::join;
 pub use map::{map, map_in, map_into, map_core};
 pub use for_each::for_each;
+
+pub(crate) use runtime::{Runtime, Worker};
+pub(crate) use join::join_on_worker;
 
 
 // temp sti stuff:
@@ -76,8 +79,23 @@ impl XorShift32 {
 }
 
 
+struct AssertSend<T> {
+    inner: T,
+}
 
-use runtime::Runtime;
+impl<T> AssertSend<T> {
+    #[inline]
+    pub unsafe fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+unsafe impl<T> Send for AssertSend<T> {}
 
 
 
