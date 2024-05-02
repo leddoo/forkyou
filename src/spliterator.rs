@@ -10,8 +10,8 @@ pub trait Spliterator: Sized {
 
 
     #[inline]
-    fn copied<'a, T>(self) -> Copied<Self>
-    where T: 'a, Self: Spliterator<Item = &'a T>
+    fn copied<'a, T: Copy + 'a>(self) -> Copied<Self>
+    where Self: Spliterator<Item = &'a T>
     {
         Copied { inner: self }
     }
@@ -182,8 +182,8 @@ pub struct Copied<I> {
     pub inner: I,
 }
 
-impl<'a, T: 'a, I: Spliterator<Item = &'a T>> Spliterator for Copied<I> {
-    type Item = I::Item;
+impl<'a, T: Copy + 'a, I: Spliterator<Item = &'a T>> Spliterator for Copied<I> {
+    type Item = T;
 
     #[inline]
     fn len(&self) -> usize {
@@ -198,7 +198,7 @@ impl<'a, T: 'a, I: Spliterator<Item = &'a T>> Spliterator for Copied<I> {
 
     #[inline]
     fn next(&mut self) -> Self::Item {
-        self.inner.next()
+        *self.inner.next()
     }
 }
 
