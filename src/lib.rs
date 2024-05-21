@@ -11,7 +11,7 @@ pub mod state_cache;
 pub mod spliterator;
 
 pub use state_cache::StateCache;
-pub use spliterator::{Spliterator, IntoSpliterator, IntoSpliteratorRef, IntoSpliteratorRefMut};
+pub use spliterator::{Spliterator, IntoSpliterator, IntoSpliteratorRef, IntoSpliteratorRefMut, SpliterChunksMut};
 
 mod runtime;
 mod untracked;

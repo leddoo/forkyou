@@ -209,7 +209,7 @@ pub struct Enumerate<I> {
     pub inner: I,
 }
 
-impl<'a, T: 'a, I: Spliterator<Item = &'a T>> Spliterator for Enumerate<I> {
+impl<I: Spliterator> Spliterator for Enumerate<I> {
     type Item = (usize, I::Item);
 
     #[inline]
@@ -255,6 +255,46 @@ impl<I1: Spliterator, I2: Spliterator> Spliterator for Zip<I1, I2> {
     #[inline]
     fn next(&mut self) -> Self::Item {
         (self.i1.next(), self.i2.next())
+    }
+}
+
+
+#[derive(Debug)]
+pub struct ChunksMut<'a, T> {
+    pub inner: &'a mut [T],
+    pub chunk_size: usize,
+}
+
+impl<'a, T> Spliterator for ChunksMut<'a, T> {
+    type Item = &'a mut [T];
+
+    fn len(&self) -> usize {
+        self.inner.len() / self.chunk_size
+    }
+
+    fn split(self, at: usize) -> (Self, Self) {
+        let (lhs, rhs) = self.inner.split_at_mut(at*self.chunk_size);
+        (Self { inner: lhs, chunk_size: self.chunk_size },
+         Self { inner: rhs, chunk_size: self.chunk_size })
+    }
+
+    fn next(&mut self) -> Self::Item {
+        let inner = sti::mem::replace(&mut self.inner, &mut []);
+        let (chunk, rest) = inner.split_at_mut(self.chunk_size);
+        self.inner = rest;
+        return chunk;
+    }
+}
+
+pub trait SpliterChunksMut<T> {
+    fn spliter_chunks_mut(&mut self, chunk_size: usize) -> ChunksMut<T>;
+}
+
+impl<T> SpliterChunksMut<T> for [T] {
+    fn spliter_chunks_mut(&mut self, chunk_size: usize) -> ChunksMut<T> {
+        assert!(chunk_size > 0);
+        assert!(self.len() % chunk_size == 0);
+        ChunksMut { inner: self, chunk_size }
     }
 }
 
